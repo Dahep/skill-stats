@@ -50,17 +50,34 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - New threads only: analysis covers sessions created after the plugin exists;
   every session predating the plugin within the db span (which begins
   2026-03-24) is historical and excluded from skill metrics.
-- Plugin (future work): logs at skill load — skill dir content hash, session
-  and message ids, source (user-invoked vs auto), context size. This is the
-  authoritative capture; without it, skill metrics by build only explicit
-  `skill` tool calls.
+- Plugin (future work): V2 plugin API only — V1 plugin implementations do
+  not run in V2 (`Plugin.define` + `setup(ctx)`, hook via
+  `ctx.tool.hook("execute.before"/"after")` or `ctx.event.subscribe()`).
+  Log at skill load — skill dir content hash, session and message ids,
+  source (user-invoked vs auto), context size. This is the authoritative
+  capture; without it, skill metrics by build only explicit `skill` tool
+  calls. Verify at build: `ctx.skill` may expose skill identity/paths
+  (possibly replacing manual dir hashing), and how to observe
+  user-invoked vs auto source — in V2 recorded data the skill part carries
+  only `{name}`, so source detection needs the prompt/session hook and its
+  mechanism is not yet proven; fall back to context-size heuristics if
+  source detection fails.
 - Built-in skills (e.g. customize-opencode) out of scope — we don't own or
   improve them. Skills with no local dir (5 of 47 names seen) are 'external/
   unknown-version' and excluded from version-tracking metrics.
-- Import (normalized copy) from ~/.local/share/opencode/opencode.db; keep
-  source ids. Message-level data carries model/provider/cost/tokens per
-  assistant message (97.6% populated); sessions carry project dir.
+- Import (normalized copy) from the db resolved via `opencode debug paths db`
+  (path respects release channel and `OPENCODE_DB`; never hardcode). Keep
+  source ids. opencode ≥ V2 (v2.0.x, event-sourced): `session_v2` is the
+  authoritative session table (strict superset of legacy `session`); message
+  and part rows store JSON blobs — assistant cost/tokens/modelID/providerID
+  live in `message.data`, so the importer extracts via `json_extract` rather
+  than flat columns. The V1-era 97.6% message population figure must be
+  re-measured against the V2 blobs before the importer is built.
 - **Skill invocation**: explicit `skill` tool call. Unit of skill metrics.
+  In V2 parts, the skill name is `state.input.name` (not `skill`); the blob
+  shape may change again — treat `part.data` as data to json_extract, never
+  string-match. Recorded subagent tool calls are still named `task`
+  (460 parts present); parent_id session linking holds in `session_v2`.
 - **Skill cost**: cost from the message that invokes the skill until end of
   session (approximation), including costs from subagents the skill spawned
   (task tool → subagent sessions, with parent_id linking; errored subagents

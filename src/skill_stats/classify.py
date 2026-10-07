@@ -73,7 +73,11 @@ class Session:
         if not texts:
             raise RuntimeError(f"opencode CLI produced no text: {involved_lines[-3:]}")
         if not self.session_id:
-            sid = involved_lines[-1].get("sessionID")
+            # opencode --format json puts sessionID on every emitted line; take
+            # the first one carrying it rather than the last line, which may be
+            # a trailing event without it (e.g. step/idle events).
+            sids = [e.get("sessionID") for e in involved_lines if e.get("sessionID")]
+            sid = sids[0] if sids else None
             if sid:
                 self.session_id = sid
             else:
