@@ -22,7 +22,9 @@ See `DESIGN.md` (decisions) and `CONTEXT.md` (domain language).
    attributed to every unit in its chain, each fix counted once per feature
    it reaches (`via_fix_commit_id` marks the first intermediate fix).
 5. `report` — features/year, fixes/feature, churn per feature; text, JSON
-   (`--json`), and matplotlib charts (`--charts`).
+   (`--json`), matplotlib charts (`--charts`), and a self-contained HTML page
+   (`--html [path]`: fix ranking, features-over-time, 1-month rolling
+   fixes/feature, verdict mix, commit volume, churn).
 
 ## Usage
 

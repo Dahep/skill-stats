@@ -1,8 +1,129 @@
-"""Feature-level metrics over SQL + diff scans: features/year, fixes/feature, churn."""
+"""Feature-level metrics over SQL + diff scans: features/year, fixes/feature, churn,
+and time series (features over time, 1-month-rolling fixes/feature)."""
 
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import date, timedelta
+
+
+@dataclass
+class FeatureTimePoint:
+    month: str                    # YYYY-MM
+    features_new: int
+    features_cumulative: int
+    commits: int
+    fixes: int
+
+
+@dataclass
+class RollingPoint:
+    when: str                     # YYYY-MM-DD (window end)
+    fixes_window: int             # fix commits in the trailing window
+    features_existing: int        # features created by window end
+    fixes_per_feature: float
+
+
+def _add_months(month: str, n: int) -> str:
+    y, m = int(month[:4]), int(month[5:7])
+    total = y * 12 + (m - 1) + n
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def _month_fill(first: str, last: str) -> list[str]:
+    months = []
+    cur = first
+    while cur <= last:
+        months.append(cur)
+        cur = _add_months(cur, 1)
+    return months
+
+
+def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
+    """Monthly buckets from first to last walk commit: new/cumulative features,
+    commits, and fix commits per bucket."""
+    features_by_month = {
+        r["m"]: r["n"]
+        for r in conn.execute(
+            "SELECT strftime('%Y-%m', created_at) m, COUNT(*) n FROM features GROUP BY m")
+    }
+    commits_by_month = {
+        r["m"]: r["n"]
+        for r in conn.execute(
+            "SELECT strftime('%Y-%m', committed_at) m, COUNT(*) n FROM commits GROUP BY m")
+    }
+    fixes_by_month = {
+        r["m"]: r["n"]
+        for r in conn.execute(
+            """SELECT strftime('%Y-%m', c.committed_at) m, COUNT(*) n
+               FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
+               WHERE v.verdict = 'fix' GROUP BY m""")
+    }
+    if not commits_by_month and not features_by_month:
+        return []
+    first = min(
+        min(commits_by_month, default="9999"),
+        min(features_by_month, default="9999"),
+    )
+    last = max(max(commits_by_month, default=""), max(features_by_month, default=""))
+    points: list[FeatureTimePoint] = []
+    features_seen = 0
+    for m in _month_fill(first, last):
+        n_new = features_by_month.get(m, 0)
+        features_seen += n_new
+        points.append(
+            FeatureTimePoint(
+                month=m,
+                features_new=n_new,
+                features_cumulative=features_seen,
+                commits=commits_by_month.get(m, 0),
+                fixes=fixes_by_month.get(m, 0),
+            )
+        )
+    return points
+
+
+def fixes_rolling(
+    conn: sqlite3.Connection, window_days: int = 30, step_days: int = 7
+) -> list[RollingPoint]:
+    """fixes/feature with a trailing 1-month window, sampled weekly.
+
+    Numeric fix commits falling in the trailing window (end - window_days + 1
+    .. window end), divided by the features created by the window end."""
+    fix_dates = sorted(
+        date.fromisoformat(r["d"][:10])
+        for r in conn.execute(
+            """SELECT c.committed_at d FROM commits c
+               JOIN commit_verdicts v ON v.commit_id = c.id
+               WHERE v.verdict = 'fix'""")
+    )
+    feature_dates = sorted(
+        date.fromisoformat(r["d"][:10])
+        for r in conn.execute("SELECT created_at d FROM features")
+    )
+    end = date.fromisoformat(
+        conn.execute("SELECT MAX(committed_at) d FROM commits").fetchone()["d"][:10]
+    )
+    if not fix_dates:
+        return []
+    points: list[RollingPoint] = []
+    cur = fix_dates[0]
+    span = timedelta(days=window_days - 1)
+    while cur <= end:
+        lo = cur - span
+        fixes_window = sum(1 for d in fix_dates if lo <= d <= cur)
+        features_existing = sum(1 for d in feature_dates if d <= cur)
+        ratio = fixes_window / features_existing if features_existing else 0.0
+        points.append(
+            RollingPoint(
+                when=cur.isoformat(),
+                fixes_window=fixes_window,
+                features_existing=features_existing,
+                fixes_per_feature=round(ratio, 3),
+            )
+        )
+        cur += timedelta(days=step_days)
+    return points
 
 
 @dataclass

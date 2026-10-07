@@ -83,3 +83,31 @@ def test_cli_report_text(classified, capsys):
         main(["report"])
     out = capsys.readouterr().out
     assert "Features / year" in out
+
+
+def test_rolling_and_timeline(classified):
+    from skill_stats.metrics import features_timeline, fixes_rolling
+
+    tl = features_timeline(classified)
+    assert tl and tl[-1].features_cumulative == 1
+    assert sum(p.features_new for p in tl) == 1
+
+    roll = fixes_rolling(classified)
+    assert roll and all(p.fixes_per_feature >= 0 for p in roll)
+    assert max(p.fixes_window for p in roll) <= 2
+
+
+def test_html_report(tmp_path, classified, repo):
+    from skill_stats.htmlreport import feature_rows, write_report
+    from skill_stats.lineage import close_lineage
+    from skill_stats.targets import annotate_all
+
+    assert annotate_all(repo, classified) == 2
+    close_lineage(classified)
+
+    out = write_report(classified, tmp_path / "r.html")
+    text = out.read_text(encoding="utf-8")
+    assert "<svg" in text and "skill-stats report" in text
+    assert "alpha" in text  # fixture feature named in ranking table
+    rows = feature_rows(classified, top=5)
+    assert rows and rows[0][0] == 1 and rows[0][3] == 2

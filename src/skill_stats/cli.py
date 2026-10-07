@@ -64,6 +64,7 @@ def main(argv: list[str] | None = None) -> None:
     rep = sub.add_parser("report", help="metrics text summary + optional charts")
     rep.add_argument("--db", default="skill-stats.db")
     rep.add_argument("--charts", action="store_true")
+    rep.add_argument("--html", nargs="?", const="skill-stats-report.html", default=None)
     rep.add_argument("--out", default="skill-stats-report")
     rep.add_argument("--json", action="store_true")
 
@@ -138,6 +139,11 @@ def main(argv: list[str] | None = None) -> None:
             paths = _charts(conn, args.out)
             for p in paths:
                 print(f"wrote {p}")
+        if getattr(args, "html", None):
+            from .htmlreport import write_report
+
+            html_path = write_report(conn, args.html)
+            print(f"wrote {html_path}")
     conn.close()
 
 
