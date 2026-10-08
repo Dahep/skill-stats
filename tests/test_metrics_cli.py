@@ -85,21 +85,39 @@ def test_cli_report_text(classified, capsys):
     assert "Features / year" in out
 
 
-def test_rolling_and_timeline(classified):
+def test_rolling_and_timeline(classified, repo):
+    from skill_stats.lineage import close_lineage
     from skill_stats.metrics import features_timeline, fixes_rolling
+    from skill_stats.targets import annotate_all
 
+    assert annotate_all(repo, classified) == 2
+    close_lineage(classified)
     tl = features_timeline(classified)
     assert tl and tl[-1].features_cumulative == 1
     assert sum(p.features_new for p in tl) == 1
 
     roll = fixes_rolling(classified)
     assert roll and all(p.fixes_per_feature >= 0 for p in roll)
-    assert max(p.fixes_window for p in roll) <= 2
+    # c3 (targets c1 defining alpha) + c5 (fix-of-fix, lineage -> alpha) both
+    # land on the same day: one sample, 2 fixes, 1 distinct feature touched
+    assert roll[-1].fixes_window == 2
+    assert roll[-1].features_touched == 1
+    assert roll[-1].fixes_per_feature == 2.0
+
+
+def test_rolling_and_timeline_empty_db(tmp_path):
+    from skill_stats.db import connect
+    from skill_stats.metrics import features_timeline, fixes_rolling
+
+    conn = connect(tmp_path / "empty.db")
+    assert features_timeline(conn) == []
+    assert fixes_rolling(conn) == []
 
 
 def test_html_report(tmp_path, classified, repo):
-    from skill_stats.htmlreport import feature_rows, write_report
+    from skill_stats.htmlreport import write_report
     from skill_stats.lineage import close_lineage
+    from skill_stats.metrics import feature_ranking
     from skill_stats.targets import annotate_all
 
     assert annotate_all(repo, classified) == 2
@@ -109,5 +127,5 @@ def test_html_report(tmp_path, classified, repo):
     text = out.read_text(encoding="utf-8")
     assert "<svg" in text and "skill-stats report" in text
     assert "alpha" in text  # fixture feature named in ranking table
-    rows = feature_rows(classified, top=5)
-    assert rows and rows[0][0] == 1 and rows[0][3] == 2
+    ranking = feature_ranking(classified)[:5]
+    assert ranking and ranking[0].fid == 1 and ranking[0].fixes == 2

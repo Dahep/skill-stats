@@ -12,7 +12,7 @@ import subprocess
 from datetime import date
 from pathlib import Path
 
-from .metrics import churn_per_feature, features_timeline, fixes_rolling, snapshot
+from .metrics import feature_ranking, features_timeline, fixes_rolling, snapshot
 
 C = {
     "bg": "#0f1117",
@@ -124,34 +124,7 @@ def _repo_url(repo: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------- data ----
-
-Row = tuple[int, str, str, int, int, str]
-
-
-def feature_rows(conn: sqlite3.Connection, top: int | None = None) -> list[Row]:
-    """All features ranked by attributed fixes (lineage closure), with churn
-    lines and the earliest defining-commit sha."""
-    churn = {fid: n for fid, _t, n in churn_per_feature(conn)}
-    sha = {
-        r["fid"]: r["sha"]
-        for r in conn.execute(
-            """SELECT cf.feature_id fid, MIN(c.walk_index) w, c.sha
-               FROM commits_features cf JOIN commits c ON c.id = cf.commit_id
-               WHERE cf.role = 'defines' GROUP BY cf.feature_id"""
-        )
-    }
-    rows = [
-        (
-            int(r["fid"]), str(r["title"]), str(r["d"])[:10],
-            int(r["n"]), int(churn.get(r["fid"], 0)), str(sha.get(r["fid"], "")),
-        )
-        for r in conn.execute(
-            """SELECT f.id fid, f.title, f.created_at d, COUNT(ff.fix_commit_id) n
-               FROM features f LEFT JOIN fixes_features ff ON ff.feature_id = f.id
-               GROUP BY f.id ORDER BY n DESC, f.id"""
-        )
-    ]
-    return rows[:top] if top else rows
+# feature rows come from metrics.feature_ranking (NamedTuple FeatureRank)
 
 
 # ------------------------------------------------------------- svg chars --
@@ -163,6 +136,14 @@ def _dual_chart(
     width: int = 920, height: int = 300,
 ) -> str:
     """Vertical bars with an optional line on its own right-hand scale."""
+    if not bars and not line:
+        return (
+            f'<div class="chartbox"><svg viewBox="0 0 {width} {height}"'
+            f' style="width:100%"><rect width="{width}" height="{height}"'
+            f' fill="{C["card"]}" rx="8"/>'
+            f'<text x="{width / 2}" y="{height / 2}" text-anchor="middle"'
+            f' class="tick">no data yet</text></svg></div>'
+        )
     pad_l, pad_r, pad_t, pad_b = 56, (76 if line else 18), 24, 40
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
     n = max(1, len(bars))
@@ -210,8 +191,8 @@ def _dual_chart(
             f" {line_name}</title></circle>"
             for i, v in enumerate(line)
         )
-    step = max(1, n // 11)
-    for i in range(0, n, step):  # x tick labels
+    step = max(1, len(labels) // 11)
+    for i in range(0, len(labels), step):  # x tick labels
         body.append(
             f'<text x="{sx(i):.1f}" y="{height - 16}" class="tick"'
             f' text-anchor="middle">{_esc(labels[i])}</text>'
@@ -302,7 +283,7 @@ def _donut(counts: list[tuple[str, int, str]]) -> str:
 # --------------------------------------------------------------- layout ---
 
 def _kpi(label: str, value: str, sub: str = "") -> str:
-    sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    sub_html = f'<div class="kpi-sub">{_esc(sub)}</div>' if sub else ""
     return (
         f'<div class="kpi"><div class="kpi-value">{_esc(value)}</div>'
         f'<div class="kpi-label">{_esc(label)}</div>{sub_html}</div>'
@@ -333,9 +314,9 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     first = conn.execute("SELECT MIN(committed_at) d FROM commits").fetchone()["d"] or ""
     last = conn.execute("SELECT MAX(committed_at) d FROM commits").fetchone()["d"] or ""
     span = f"{first[:10]} → {last[:10]}" if first else "—"
-    ranking = feature_rows(conn)
+    ranking = feature_ranking(conn)
     hbars_fixes = _hbars(
-        [(f"#{fid} {t}", n) for fid, t, _d, n, _c, _s in ranking[:top]],
+        [(f"#{r.fid} {r.title}", r.fixes) for r in ranking[:top]],
         C["fix"], "fixes",
     )
 
@@ -384,16 +365,16 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     donut = _donut(verdict_counts)
 
     rank_rows = []
-    for i, (fid, title, created, fixes, churn, sha) in enumerate(ranking, 1):
+    for i, r in enumerate(ranking, 1):
         link = (
-            f'<a href="{url}/commit/{sha}">{sha[:7]}</a>'
-            if url and sha
-            else (sha[:7] if sha else "—")
+            f'<a href="{html.escape(url, quote=True)}/commit/{r.sha}">{r.sha[:7]}</a>'
+            if url and r.sha
+            else (_esc(r.sha[:7]) if r.sha else "—")
         )
         rank_rows.append(
-            f"<tr><td class='num'>{i}</td><td>#{fid} &nbsp;{_esc(title)}</td>"
-            f"<td class='num'>{created}</td><td class='num'>{fixes}</td>"
-            f"<td class='num'>{churn}</td><td>{link}</td></tr>"
+            f"<tr><td class='num'>{i}</td><td>#{r.fid} &nbsp;{_esc(r.title)}</td>"
+            f"<td class='num'>{r.created}</td><td class='num'>{r.fixes}</td>"
+            f"<td class='num'>{r.churn}</td><td>{link}</td></tr>"
         )
     rank_table = (
         "<table><thead><tr>"
@@ -414,7 +395,10 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         "<tbody>" + "".join(churn_rows) + "</tbody></table>"
     )
 
-    who = f"{repo_name} <span class='muted'>({branch})</span> — {model}"
+    who = (
+        f"{_esc(repo_name)} <span class='muted'>({_esc(branch)})</span>"
+        f" — {_esc(model)}"
+    )
     other_pct = percent(
         snap.verdict_counts.get("revert", 0)
         + snap.verdict_counts.get("cleanup", 0)
@@ -427,7 +411,7 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(title)}</title><style>{CSS}</style></head>
 <body>
-<h1>skill-stats report — {_esc(repo_name)} <span class="muted">({branch})</span></h1>
+<h1>skill-stats report — {_esc(repo_name)} <span class="muted">({_esc(branch)})</span></h1>
 <div class="muted">Target repo: {_esc(repo)} &nbsp;·&nbsp; generated {date.today().isoformat()}
  &nbsp;·&nbsp; verdict model: {_esc(model)}</div>
 
@@ -444,9 +428,10 @@ multiple features from one commit.</div>
 
 <section>
 <h2>fixes / feature — trailing 1-month window</h2>
-<div class="note">Each point: fix commits (attributed via lineage to any feature)
-that fall in the trailing 30 days, divided by the number of features that
-existed at the window's end. Sampled every 7 days.</div>
+<div class="note">Each point: all fix commits that fall in the trailing 30 days,
+divided by the number of distinct features those fixes reach through the
+lineage closure (a feature counts once however many fixes touch it). Sampled
+every 7 days, with a final sample at the latest commit date.</div>
 {fixes_roller}
 </section>
 
@@ -484,8 +469,8 @@ LLM session via the opencode CLI (<code>{_esc(model)}</code>), one JSON verdict
 per commit. Fixes: blame evidence at the first parent
 (<code>git blame -w -C --first-parent</code>, ≥{min_lines} lines). Lineage:
 <code>fixes_features</code> transitive closure — a fix of a fix is attributed to
-every feature in its chain. Running 1-month window: fix commits ÷
-existing features. Generated by <code>skill-stats</code> from
+every feature in its chain. Running 1-month window: fix commits in trailing
+window ÷ distinct features those fixes reach. Generated by <code>skill-stats</code> from
 <code>{_esc(db_path)}</code>.
 <div class="muted">{who}</div>
 </div>

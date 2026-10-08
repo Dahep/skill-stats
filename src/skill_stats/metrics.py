@@ -5,6 +5,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import NamedTuple
 
 
 @dataclass
@@ -18,9 +19,9 @@ class FeatureTimePoint:
 
 @dataclass
 class RollingPoint:
-    when: str                     # YYYY-MM-DD (window end)
+    when: str                     # YYYY-MM-DD (window end, UTC-normalized)
     fixes_window: int             # fix commits in the trailing window
-    features_existing: int        # features created by window end
+    features_touched: int         # distinct features those fixes reach
     fixes_per_feature: float
 
 
@@ -88,41 +89,50 @@ def fixes_rolling(
 ) -> list[RollingPoint]:
     """fixes/feature with a trailing 1-month window, sampled weekly.
 
-    Numeric fix commits falling in the trailing window (end - window_days + 1
-    .. window end), divided by the features created by the window end."""
-    fix_dates = sorted(
-        date.fromisoformat(r["d"][:10])
-        for r in conn.execute(
-            """SELECT c.committed_at d FROM commits c
-               JOIN commit_verdicts v ON v.commit_id = c.id
-               WHERE v.verdict = 'fix'""")
-    )
-    feature_dates = sorted(
-        date.fromisoformat(r["d"][:10])
-        for r in conn.execute("SELECT created_at d FROM features")
-    )
-    end = date.fromisoformat(
-        conn.execute("SELECT MAX(committed_at) d FROM commits").fetchone()["d"][:10]
-    )
+    Numerator: all fix commits falling in the trailing window (end -
+    window_days + 1 .. window end). Denominator: the distinct features those
+    fixes reach through the fixes_features lineage closure — a feature counts
+    once however many fixes touch it. Dates are normalized by SQLite
+    (strftime) so month buckets and windows share one timezone convention.
+    The last sample is always placed at the latest commit date."""
+    end_s = conn.execute(
+        "SELECT MAX(strftime('%Y-%m-%d', committed_at)) d FROM commits"
+    ).fetchone()["d"]
+    if not end_s:
+        return []
+    end = date.fromisoformat(end_s)
+
+    fix_dates: dict[int, date] = {}
+    for r in conn.execute(
+        """SELECT v.commit_id id, strftime('%Y-%m-%d', c.committed_at) d
+           FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
+           WHERE v.verdict = 'fix'"""
+    ):
+        fix_dates[r["id"]] = date.fromisoformat(r["d"])
     if not fix_dates:
         return []
-    points: list[RollingPoint] = []
-    cur = fix_dates[0]
+
+    reached: dict[int, set[int]] = {}
+    for r in conn.execute("SELECT fix_commit_id, feature_id FROM fixes_features"):
+        reached.setdefault(r["fix_commit_id"], set()).add(r["feature_id"])
+
     span = timedelta(days=window_days - 1)
+
+    def pt(day: date) -> RollingPoint:
+        lo = day - span
+        fixes_in = [cid for cid, d in fix_dates.items() if lo <= d <= day]
+        touched = set().union(*(reached.get(cid, set()) for cid in fixes_in))
+        n = len(fixes_in)
+        ratio = round(n / len(touched), 3) if touched else 0.0
+        return RollingPoint(day.isoformat(), n, len(touched), ratio)
+
+    points: list[RollingPoint] = []
+    cur = min(fix_dates.values())
     while cur <= end:
-        lo = cur - span
-        fixes_window = sum(1 for d in fix_dates if lo <= d <= cur)
-        features_existing = sum(1 for d in feature_dates if d <= cur)
-        ratio = fixes_window / features_existing if features_existing else 0.0
-        points.append(
-            RollingPoint(
-                when=cur.isoformat(),
-                fixes_window=fixes_window,
-                features_existing=features_existing,
-                fixes_per_feature=round(ratio, 3),
-            )
-        )
+        points.append(pt(cur))
         cur += timedelta(days=step_days)
+    if points[-1].when != end.isoformat():
+        points.append(pt(end))
     return points
 
 
@@ -175,6 +185,43 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[int, str, int]]:
     )
 
 
+class FeatureRank(NamedTuple):
+    """One feature with its attributed-fix count and total churn (lines)."""
+
+    fid: int
+    title: str
+    created: str              # YYYY-MM-DD, first defining-commit date
+    fixes: int
+    churn: int
+    sha: str                  # earliest defining commit sha
+
+
+def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
+    """All features ranked by attributed fixes (lineage closure, ties broken
+    by feature id), with churn and the earliest defining-commit sha."""
+    churn = {fid: n for fid, _t, n in churn_per_feature(conn)}
+    sha = {
+        r["fid"]: r["sha"]
+        for r in conn.execute(
+            """SELECT cf.feature_id fid, MIN(c.walk_index) w, c.sha
+               FROM commits_features cf JOIN commits c ON c.id = cf.commit_id
+               WHERE cf.role = 'defines' GROUP BY cf.feature_id"""
+        )
+    }
+    return [
+        FeatureRank(
+            fid=int(r["fid"]), title=str(r["title"]), created=str(r["d"])[:10],
+            fixes=int(r["n"]), churn=int(churn.get(r["fid"], 0)),
+            sha=str(sha.get(r["fid"], "")),
+        )
+        for r in conn.execute(
+            """SELECT f.id fid, f.title, f.created_at d, COUNT(ff.fix_commit_id) n
+               FROM features f LEFT JOIN fixes_features ff ON ff.feature_id = f.id
+               GROUP BY f.id ORDER BY n DESC, f.id"""
+        )
+    ]
+
+
 def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
     total_commits = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
     verdict_counts = {
@@ -216,13 +263,7 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
     ]
 
     top_features_by_fixes = [
-        (r["id"], r["title"], r["n"])
-        for r in conn.execute(
-            """SELECT f.id, f.title, COUNT(ff.fix_commit_id) n FROM features f
-                LEFT JOIN fixes_features ff ON ff.feature_id = f.id
-                GROUP BY f.id ORDER BY n DESC LIMIT ?""",
-            (top,),
-        )
+        (r.fid, r.title, r.fixes) for r in feature_ranking(conn)[:top]
     ]
 
     fixes_uncovered = conn.execute(
