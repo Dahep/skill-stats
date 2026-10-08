@@ -6,6 +6,7 @@ time, 1-month-rolling fixes/feature, plus the rest of the gathered snapshot
 """
 
 import html
+import json
 import sqlite3
 import subprocess
 from datetime import date
@@ -51,6 +52,7 @@ a:hover {{ text-decoration: underline; }}
 .note {{ color: {C["muted"]}; font-size: 12px; margin: 6px 0 12px; }}
 .legend {{ display: flex; gap: 18px; font-size: 12px; color: {C["muted"]};
           margin: 8px 2px 0; align-items: center; }}
+.chartbox {{ margin-top: 6px; }}
 .donut-row {{ display: flex; gap: 22px; align-items: center;
              background: {C["card"]}; border: 1px solid {C["border"]};
              border-radius: 10px; padding: 16px 20px; flex-wrap: wrap; }}
@@ -75,6 +77,24 @@ td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
         border-top: 1px solid {C["border"]}; padding-top: 12px; }}
 .foot code {{ color: {C["text"]}; }}
 @media (max-width: 720px) {{ .kpis {{ grid-template-columns: 1fr 1fr; }} }}
+@media print {{
+  @page {{ size: A4; margin: 9mm; }}
+  body {{ max-width: none; padding: 0; margin: 0; }}
+  h2 {{ margin: 16px 0 6px; }}
+  section {{ margin: 0; }}
+  .kpi {{ padding: 10px 14px; }}
+  .kpi-value {{ font-size: 21px; }}
+  .kpis {{ gap: 8px; margin: 14px 0 2px; }}
+  .note {{ margin: 4px 0 6px; }}
+  .chartbox {{ margin-top: 2px; }}
+  .legend {{ margin: 4px 2px 0; }}
+  * {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+  .kpi, .donut-row, svg {{ break-inside: avoid; }}
+  .chartbox {{ break-inside: avoid; }}
+  tr {{ break-inside: avoid; }}
+  thead {{ display: table-header-group; }}
+  a {{ color: inherit; }}
+}}
 """
 
 
@@ -213,9 +233,9 @@ def _dual_chart(
             )
         legend = f'<div class="legend">{"".join(pieces)}</div>'
     return (
-        legend
+        f'<div class="chartbox">{legend}'
         + f'<svg viewBox="0 0 {width} {height}" role="img" style="width:100%">'
-        + "".join(body) + "</svg>"
+        + "".join(body) + "</svg></div>"
     )
 
 
@@ -292,7 +312,12 @@ def _kpi(label: str, value: str, sub: str = "") -> str:
 def build(conn: sqlite3.Connection, top: int = 15) -> str:
     snap = snapshot(conn, top=top)
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
-    settings = {r["key"]: r["value"] for r in rows}
+    settings: dict[str, str] = {}
+    for r in rows:  # values are stored JSON-encoded (cli._set); parse, else raw
+        try:
+            settings[r["key"]] = json.loads(r["value"])
+        except (json.JSONDecodeError, TypeError):
+            settings[r["key"]] = r["value"]
     repo = str(settings.get("repo", ""))
     model = str(settings.get("model", ""))
     min_lines = int(settings.get("min_target_lines", 1))
