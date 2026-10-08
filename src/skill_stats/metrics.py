@@ -1,8 +1,139 @@
-"""Feature-level metrics over SQL + diff scans: features/year, fixes/feature, churn."""
+"""Feature-level metrics over SQL + diff scans: features/year, fixes/feature, churn,
+and time series (features over time, 1-month-rolling fixes/feature)."""
 
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import NamedTuple
+
+
+@dataclass
+class FeatureTimePoint:
+    month: str                    # YYYY-MM
+    features_new: int
+    features_cumulative: int
+    commits: int
+    fixes: int
+
+
+@dataclass
+class RollingPoint:
+    when: str                     # YYYY-MM-DD (window end, UTC-normalized)
+    fixes_window: int             # fix commits in the trailing window
+    features_touched: int         # distinct features those fixes reach
+    fixes_per_feature: float
+
+
+def _add_months(month: str, n: int) -> str:
+    y, m = int(month[:4]), int(month[5:7])
+    total = y * 12 + (m - 1) + n
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def _month_fill(first: str, last: str) -> list[str]:
+    months = []
+    cur = first
+    while cur <= last:
+        months.append(cur)
+        cur = _add_months(cur, 1)
+    return months
+
+
+def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
+    """Monthly buckets from first to last walk commit: new/cumulative features,
+    commits, and fix commits per bucket."""
+    features_by_month = {
+        r["m"]: r["n"]
+        for r in conn.execute(
+            "SELECT strftime('%Y-%m', created_at) m, COUNT(*) n FROM features GROUP BY m")
+    }
+    commits_by_month = {
+        r["m"]: r["n"]
+        for r in conn.execute(
+            "SELECT strftime('%Y-%m', committed_at) m, COUNT(*) n FROM commits GROUP BY m")
+    }
+    fixes_by_month = {
+        r["m"]: r["n"]
+        for r in conn.execute(
+            """SELECT strftime('%Y-%m', c.committed_at) m, COUNT(*) n
+               FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
+               WHERE v.verdict = 'fix' GROUP BY m""")
+    }
+    if not commits_by_month and not features_by_month:
+        return []
+    first = min(
+        min(commits_by_month, default="9999"),
+        min(features_by_month, default="9999"),
+    )
+    last = max(max(commits_by_month, default=""), max(features_by_month, default=""))
+    points: list[FeatureTimePoint] = []
+    features_seen = 0
+    for m in _month_fill(first, last):
+        n_new = features_by_month.get(m, 0)
+        features_seen += n_new
+        points.append(
+            FeatureTimePoint(
+                month=m,
+                features_new=n_new,
+                features_cumulative=features_seen,
+                commits=commits_by_month.get(m, 0),
+                fixes=fixes_by_month.get(m, 0),
+            )
+        )
+    return points
+
+
+def fixes_rolling(
+    conn: sqlite3.Connection, window_days: int = 30, step_days: int = 7
+) -> list[RollingPoint]:
+    """fixes/feature with a trailing 1-month window, sampled weekly.
+
+    Numerator: all fix commits falling in the trailing window (end -
+    window_days + 1 .. window end). Denominator: the distinct features those
+    fixes reach through the fixes_features lineage closure — a feature counts
+    once however many fixes touch it. Dates are normalized by SQLite
+    (strftime) so month buckets and windows share one timezone convention.
+    The last sample is always placed at the latest commit date."""
+    end_s = conn.execute(
+        "SELECT MAX(strftime('%Y-%m-%d', committed_at)) d FROM commits"
+    ).fetchone()["d"]
+    if not end_s:
+        return []
+    end = date.fromisoformat(end_s)
+
+    fix_dates: dict[int, date] = {}
+    for r in conn.execute(
+        """SELECT v.commit_id id, strftime('%Y-%m-%d', c.committed_at) d
+           FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
+           WHERE v.verdict = 'fix'"""
+    ):
+        fix_dates[r["id"]] = date.fromisoformat(r["d"])
+    if not fix_dates:
+        return []
+
+    reached: dict[int, set[int]] = {}
+    for r in conn.execute("SELECT fix_commit_id, feature_id FROM fixes_features"):
+        reached.setdefault(r["fix_commit_id"], set()).add(r["feature_id"])
+
+    span = timedelta(days=window_days - 1)
+
+    def pt(day: date) -> RollingPoint:
+        lo = day - span
+        fixes_in = [cid for cid, d in fix_dates.items() if lo <= d <= day]
+        touched = set().union(*(reached.get(cid, set()) for cid in fixes_in))
+        n = len(fixes_in)
+        ratio = round(n / len(touched), 3) if touched else 0.0
+        return RollingPoint(day.isoformat(), n, len(touched), ratio)
+
+    points: list[RollingPoint] = []
+    cur = min(fix_dates.values())
+    while cur <= end:
+        points.append(pt(cur))
+        cur += timedelta(days=step_days)
+    if points[-1].when != end.isoformat():
+        points.append(pt(end))
+    return points
 
 
 @dataclass
@@ -54,6 +185,43 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[int, str, int]]:
     )
 
 
+class FeatureRank(NamedTuple):
+    """One feature with its attributed-fix count and total churn (lines)."""
+
+    fid: int
+    title: str
+    created: str              # YYYY-MM-DD, first defining-commit date
+    fixes: int
+    churn: int
+    sha: str                  # earliest defining commit sha
+
+
+def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
+    """All features ranked by attributed fixes (lineage closure, ties broken
+    by feature id), with churn and the earliest defining-commit sha."""
+    churn = {fid: n for fid, _t, n in churn_per_feature(conn)}
+    sha = {
+        r["fid"]: r["sha"]
+        for r in conn.execute(
+            """SELECT cf.feature_id fid, MIN(c.walk_index) w, c.sha
+               FROM commits_features cf JOIN commits c ON c.id = cf.commit_id
+               WHERE cf.role = 'defines' GROUP BY cf.feature_id"""
+        )
+    }
+    return [
+        FeatureRank(
+            fid=int(r["fid"]), title=str(r["title"]), created=str(r["d"])[:10],
+            fixes=int(r["n"]), churn=int(churn.get(r["fid"], 0)),
+            sha=str(sha.get(r["fid"], "")),
+        )
+        for r in conn.execute(
+            """SELECT f.id fid, f.title, f.created_at d, COUNT(ff.fix_commit_id) n
+               FROM features f LEFT JOIN fixes_features ff ON ff.feature_id = f.id
+               GROUP BY f.id ORDER BY n DESC, f.id"""
+        )
+    ]
+
+
 def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
     total_commits = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
     verdict_counts = {
@@ -95,13 +263,7 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
     ]
 
     top_features_by_fixes = [
-        (r["id"], r["title"], r["n"])
-        for r in conn.execute(
-            """SELECT f.id, f.title, COUNT(ff.fix_commit_id) n FROM features f
-                LEFT JOIN fixes_features ff ON ff.feature_id = f.id
-                GROUP BY f.id ORDER BY n DESC LIMIT ?""",
-            (top,),
-        )
+        (r.fid, r.title, r.fixes) for r in feature_ranking(conn)[:top]
     ]
 
     fixes_uncovered = conn.execute(
