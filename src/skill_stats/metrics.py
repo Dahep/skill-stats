@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 @dataclass
 class FeatureTimePoint:
-    month: str                    # YYYY-MM
+    month: str  # YYYY-MM
     features_new: int
     features_cumulative: int
     commits: int
@@ -19,9 +19,9 @@ class FeatureTimePoint:
 
 @dataclass
 class RollingPoint:
-    when: str                     # YYYY-MM-DD (window end, UTC-normalized)
-    fixes_window: int             # fix commits in the trailing window
-    features_touched: int         # distinct features those fixes reach
+    when: str  # YYYY-MM-DD (window end, UTC-normalized)
+    fixes_window: int  # fix commits in the trailing window
+    features_touched: int  # distinct features those fixes reach
     fixes_per_feature: float
 
 
@@ -46,19 +46,22 @@ def features_timeline(conn: sqlite3.Connection) -> list[FeatureTimePoint]:
     features_by_month = {
         r["m"]: r["n"]
         for r in conn.execute(
-            "SELECT strftime('%Y-%m', created_at) m, COUNT(*) n FROM features GROUP BY m")
+            "SELECT strftime('%Y-%m', created_at) m, COUNT(*) n FROM features GROUP BY m"
+        )
     }
     commits_by_month = {
         r["m"]: r["n"]
         for r in conn.execute(
-            "SELECT strftime('%Y-%m', committed_at) m, COUNT(*) n FROM commits GROUP BY m")
+            "SELECT strftime('%Y-%m', committed_at) m, COUNT(*) n FROM commits GROUP BY m"
+        )
     }
     fixes_by_month = {
         r["m"]: r["n"]
         for r in conn.execute(
             """SELECT strftime('%Y-%m', c.committed_at) m, COUNT(*) n
                FROM commits c JOIN commit_verdicts v ON v.commit_id = c.id
-               WHERE v.verdict = 'fix' GROUP BY m""")
+               WHERE v.verdict = 'fix' GROUP BY m"""
+        )
     }
     if not commits_by_month and not features_by_month:
         return []
@@ -112,7 +115,7 @@ def fixes_rolling(
     if not fix_dates:
         return []
 
-    reached: dict[int, set[int]] = {}
+    reached: dict[int, set[str]] = {}
     for r in conn.execute("SELECT fix_commit_id, feature_id FROM fixes_features"):
         reached.setdefault(r["fix_commit_id"], set()).add(r["feature_id"])
 
@@ -142,58 +145,39 @@ class MetricSnapshot:
     verdict_counts: dict[str, int]
     total_features: int
     total_fixes: int
-    years: list[tuple[str, int]]                      # year -> features created
+    years: list[tuple[str, int]]  # year -> features created
     features_per_year: float
-    fixes_per_feature: float                          # overall mean
+    fixes_per_feature: float  # overall mean
     # year -> mean fixes per feature created that year
     fixes_by_year_mean: list[tuple[str, float]]
-    top_features_by_fixes: list[tuple[int, str, int]]
-    top_features_by_churn: list[tuple[int, str, int]]
-    fixes_uncovered: int                              # fix verdicts attributed to no feature
+    top_features_by_fixes: list[tuple[str, str, int]]
+    top_features_by_churn: list[tuple[str, str, int]]
+    fixes_uncovered: int  # fix verdicts attributed to no feature
 
 
-def _diff_churn(diff: str) -> int:
-    added = sum(
-        1 for line in diff.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-    )
-    deleted = sum(
-        1 for line in diff.splitlines()
-        if line.startswith("-") and not line.startswith("---")
-    )
-    return added + deleted
-
-
-def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[int, str, int]]:
+def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
+    """(feature id, title, churn lines) per feature over its linked commits.
+    Churn is read from the walk-stored churn_lines columns (derived at walk
+    time by gitwalk.prepare_diff — the single source of the counting rules)."""
     rows = conn.execute(
-        """SELECT f.id, f.title, cf.commit_id FROM features f
+        """SELECT f.id, f.title, COALESCE(SUM(c.churn_lines), 0) n FROM features f
            JOIN commits_features cf ON cf.feature_id = f.id
-           GROUP BY f.id, cf.commit_id"""
+           JOIN commits c ON c.id = cf.commit_id
+           GROUP BY f.id, f.title"""
     ).fetchall()
-
-    commit_diffs = {
-        r["id"]: r["diff"]
-        for r in conn.execute("SELECT id, diff FROM commits")
-    }
-    churn: dict[int, tuple[str, int]] = {}
-    for r in rows:
-        fid, title = int(r["id"]), str(r["title"])
-        lines = int(churn.get(fid, (title, 0))[1]) + _diff_churn(commit_diffs[r["commit_id"]])
-        churn[fid] = (title, lines)
-    return sorted(
-        ((fid, t, n) for fid, (t, n) in churn.items()), key=lambda kv: -kv[2]
-    )
+    out = [(str(r["id"]), str(r["title"]), int(r["n"])) for r in rows]
+    return sorted(out, key=lambda kv: (-kv[2], kv[0]))
 
 
 class FeatureRank(NamedTuple):
     """One feature with its attributed-fix count and total churn (lines)."""
 
-    fid: int
+    fid: str
     title: str
-    created: str              # YYYY-MM-DD, first defining-commit date
+    created: str  # YYYY-MM-DD, first defining-commit date
     fixes: int
     churn: int
-    sha: str                  # earliest defining commit sha
+    sha: str  # earliest defining commit sha
 
 
 def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
@@ -210,8 +194,11 @@ def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
     }
     return [
         FeatureRank(
-            fid=int(r["fid"]), title=str(r["title"]), created=str(r["d"])[:10],
-            fixes=int(r["n"]), churn=int(churn.get(r["fid"], 0)),
+            fid=str(r["fid"]),
+            title=str(r["title"]),
+            created=str(r["d"])[:10],
+            fixes=int(r["n"]),
+            churn=int(churn.get(str(r["fid"]), 0)),
             sha=str(sha.get(r["fid"], "")),
         )
         for r in conn.execute(
@@ -226,9 +213,7 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
     total_commits = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
     verdict_counts = {
         r["verdict"]: r["n"]
-        for r in conn.execute(
-            "SELECT verdict, COUNT(*) n FROM commit_verdicts GROUP BY verdict"
-        )
+        for r in conn.execute("SELECT verdict, COUNT(*) n FROM commit_verdicts GROUP BY verdict")
     }
     total_features = conn.execute("SELECT COUNT(*) c FROM features").fetchone()["c"]
     total_fixes = verdict_counts.get("fix", 0)
@@ -258,13 +243,9 @@ def snapshot(conn: sqlite3.Connection, top: int = 15) -> MetricSnapshot:
         "SELECT id, title, strftime('%Y', created_at) yr FROM features ORDER BY id"
     ):
         fixes_by_year.setdefault(r["yr"], []).append(fixes_per_feature_map.get(r["id"], 0))
-    fixes_by_year_mean = [
-        (yr, sum(vals) / len(vals)) for yr, vals in sorted(fixes_by_year.items())
-    ]
+    fixes_by_year_mean = [(yr, sum(vals) / len(vals)) for yr, vals in sorted(fixes_by_year.items())]
 
-    top_features_by_fixes = [
-        (r.fid, r.title, r.fixes) for r in feature_ranking(conn)[:top]
-    ]
+    top_features_by_fixes = [(r.fid, r.title, r.fixes) for r in feature_ranking(conn)[:top]]
 
     fixes_uncovered = conn.execute(
         """SELECT COUNT(*) c FROM commit_verdicts v

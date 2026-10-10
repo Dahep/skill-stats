@@ -24,7 +24,7 @@ Decide, Impartially, a single verdict per commit. Do not read files, do not run 
 commands, do not call tools: reply with ONE JSON object on a single line, nothing else.
 Reply formats (choose exactly one):
 {"k":"new","title":"<2-6 word Feature name>","about":"<one sentence>","why":"<short reason>"}
-{"k":"existing","f":<id>,"why":"<short reason>"}
+{"k":"existing","f":"<id>","why":"<short reason>"}
 {"k":"fix","why":"<what line-belonging context it repairs>"}
 {"k":"refactor","why":"<restructures Feature lines, no defect repair intent>"}
 {"k":"revert","why":"<undoes an earlier commit>"}
@@ -57,7 +57,11 @@ class Session:
             argv += ["-s", self.session_id]
         argv.append(message)
         proc = subprocess.run(
-            argv, cwd=SESSION_DIR, capture_output=True, text=True, check=False,
+            argv,
+            cwd=SESSION_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
             env={**os.environ, "TERM": "dumb"},
         )
         if proc.returncode != 0 and not proc.stdout.strip():
@@ -65,11 +69,7 @@ class Session:
         involved_lines = [
             json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")
         ]
-        texts = [
-            e["part"].get("text", "")
-            for e in involved_lines
-            if e.get("type") == "text"
-        ]
+        texts = [e["part"].get("text", "") for e in involved_lines if e.get("type") == "text"]
         if not texts:
             raise RuntimeError(f"opencode CLI produced no text: {involved_lines[-3:]}")
         if not self.session_id:
@@ -98,14 +98,15 @@ def parse_reply(text: str) -> Reply:
 
 def feature_registry(conn: sqlite3.Connection, feature_cap: int = 180) -> str:
     """Compacts the current Feature list for the rolling context. The compact block
-    is embedded in each prompt so the model always cites real ids."""
+    is embedded in each prompt so the model always cites real ids. Ordered by
+    insertion (feature ids are repo-prefixed TEXT, no longer numerically ordered)."""
     rows = conn.execute(
         """SELECT f.id, f.title, f.about,
                   (SELECT COUNT(*) FROM commits_features cf WHERE cf.feature_id = f.id) nc,
                   (SELECT c2.sha FROM commits_features cf2
                    JOIN commits c2 ON c2.id = cf2.commit_id
                    WHERE cf2.feature_id = f.id ORDER BY c2.walk_index DESC LIMIT 1) last_sha
-           FROM features f ORDER BY f.id"""
+           FROM features f ORDER BY f.rowid"""
     ).fetchall()
     rows = rows[-feature_cap:]
     if not rows:
@@ -117,9 +118,7 @@ def feature_registry(conn: sqlite3.Connection, feature_cap: int = 180) -> str:
 
 
 def commit_prompt(conn: sqlite3.Connection, walk_index: int) -> str:
-    commit = conn.execute(
-        "SELECT * FROM commits WHERE walk_index = ?", (walk_index,)
-    ).fetchone()
+    commit = conn.execute("SELECT * FROM commits WHERE walk_index = ?", (walk_index,)).fetchone()
     diff = commit["diff"] or ""
     if len(diff) > DIFF_CAP:
         diff = diff[:DIFF_CAP] + f"\n... [diff truncated, {len(commit['diff'])} chars total]"
@@ -127,10 +126,12 @@ def commit_prompt(conn: sqlite3.Connection, walk_index: int) -> str:
     if len(body) > BODY_CAP:
         body = body[:BODY_CAP] + " ... [body truncated]"
     merged_note = " (merge commit)" if commit["kind"] == "merge" else ""
-    return PROMPT_HEADER + f"""
+    return (
+        PROMPT_HEADER
+        + f"""
 
-COMMIT {commit['sha'][:12]} walk={walk_index} {commit['committed_at']}{merged_note}
-TITLE: {commit['title']}
+COMMIT {commit["sha"][:12]} walk={walk_index} {commit["committed_at"]}{merged_note}
+TITLE: {commit["title"]}
 BODY:
 {body}
 DIFF:
@@ -139,7 +140,8 @@ DIFF:
 FEATURES (id: title — about [commits, sha]):
 {feature_registry(conn)}
 
-Classify COMMIT {commit['sha'][:12]}: one JSON object line."""
+Classify COMMIT {commit["sha"][:12]}: one JSON object line."""
+    )
 
 
 K_TO_VERDICT = {
@@ -151,9 +153,39 @@ K_TO_VERDICT = {
     "cleanup": "cleanup",
 }
 
+_FEATURE_SUFFIX_RE = re.compile(r"-(\d+)$")
 
-def apply_reply(conn: sqlite3.Connection, commit_id: int, committed_at: str,
-                reply: Reply, raw: str, model: str) -> str:
+
+def next_feature_id(conn: sqlite3.Connection, repo_id: int) -> str:
+    """Next repo-prefixed feature id '{slug}-{local number}' (ADR-0003 clause
+    5): the slug comes from the commit's repository row, the local number from
+    the highest suffix among this repo's existing ids."""
+    row = conn.execute("SELECT slug FROM repositories WHERE id = ?", (repo_id,)).fetchone()
+    if not row:
+        raise ValueError(f"unknown repo_id {repo_id}")
+    top = 0
+    for r in conn.execute("SELECT id FROM features WHERE repo_id = ?", (repo_id,)):
+        m = _FEATURE_SUFFIX_RE.search(str(r["id"]))
+        if m:
+            top = max(top, int(m.group(1)))
+    return f"{row['slug']}-{top + 1}"
+
+
+def create_feature(
+    conn: sqlite3.Connection, repo_id: int, title: str, about: str, created_at: str
+) -> str:
+    """Insert a Feature row with a freshly minted repo-prefixed id; returns it."""
+    fid = next_feature_id(conn, repo_id)
+    conn.execute(
+        "INSERT INTO features (id, title, about, created_at, repo_id) VALUES (?, ?, ?, ?, ?)",
+        (fid, title, about, created_at, repo_id),
+    )
+    return fid
+
+
+def apply_reply(
+    conn: sqlite3.Connection, commit_id: int, committed_at: str, reply: Reply, raw: str, model: str
+) -> str:
     """Store verdict + feature rows atomically. Returns the verdict."""
     verdict = K_TO_VERDICT[reply.kind]
     rationale = " ".join(str(reply.payload.get("why", ""))[:300].split()) or None
@@ -167,20 +199,17 @@ def apply_reply(conn: sqlite3.Connection, commit_id: int, committed_at: str,
         if reply.kind == "new":
             title = str(reply.payload.get("title") or commit_at(conn, commit_id)["title"]).strip()
             about = str(reply.payload.get("about") or "").strip()
-            cur = conn.execute(
-                "INSERT INTO features (title, about, created_at) VALUES (?, ?, ?)",
-                (title, about, committed_at),
-            )
+            crow = conn.execute("SELECT repo_id FROM commits WHERE id = ?", (commit_id,)).fetchone()
+            assert crow is not None
+            fid = create_feature(conn, int(crow["repo_id"]), title, about, committed_at)
             conn.execute(
                 "INSERT INTO commits_features (commit_id, feature_id, role)"
                 " VALUES (?, ?, 'defines')",
-                (commit_id, cur.lastrowid),
+                (commit_id, fid),
             )
         elif reply.kind == "existing":
-            feature_id = int(reply.payload["f"])
-            if not conn.execute(
-                "SELECT 1 FROM features WHERE id = ?", (feature_id,)
-            ).fetchone():
+            feature_id = str(reply.payload["f"])
+            if not conn.execute("SELECT 1 FROM features WHERE id = ?", (feature_id,)).fetchone():
                 raise ValueError(f"cited unknown feature id {feature_id}")
             conn.execute(
                 "INSERT OR IGNORE INTO commits_features (commit_id, feature_id, role)"
@@ -198,8 +227,9 @@ def commit_at(conn: sqlite3.Connection, commit_id: int) -> sqlite3.Row:
     return out
 
 
-def classify_pending(repo: Path, conn: sqlite3.Connection, model: str,
-                     session: Session, limit: int | None = None) -> list[int]:
+def classify_pending(
+    repo: Path, conn: sqlite3.Connection, model: str, session: Session, limit: int | None = None
+) -> list[int]:
     """Resume-aware rolling classification. Returns processed commit ids."""
     pending = conn.execute(
         """SELECT id, committed_at, walk_index FROM commits
@@ -210,9 +240,7 @@ def classify_pending(repo: Path, conn: sqlite3.Connection, model: str,
     processed: list[int] = []
     for row in pending:
         msg = commit_prompt(conn, row["walk_index"])
-        crow = conn.execute(
-            "SELECT kind, diff FROM commits WHERE id = ?", (row["id"],)
-        ).fetchone()
+        crow = conn.execute("SELECT kind, diff FROM commits WHERE id = ?", (row["id"],)).fetchone()
         assert crow is not None
         if crow["kind"] == "merge" and not crow["diff"]:
             with conn:

@@ -11,7 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .gitwalk import _git
+from .gitwalk import _git, is_store_path, parse_diff_header
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.M)
 
@@ -31,9 +31,13 @@ def changed_hunks(repo: Path, sha: str) -> dict[str, list[Hunk]]:
     current: str | None = None
     for line in out.splitlines():
         if line.startswith("diff --git "):
-            m: re.Match[str] | None
-            if m := re.match(r"diff --git a/(.*?) b/.*$", line):
-                current = m.group(1)
+            paths = parse_diff_header(line)
+            if paths is None or is_store_path(paths[0]) or is_store_path(paths[1]):
+                # store paths (either side: renames into/out of the store
+                # included) never contribute blame evidence (ADR-0003 cl. 4)
+                current = None
+            else:
+                current = paths[0]
                 per_file.setdefault(current, [])
         elif current is not None:
             per_file[current].append(line)
@@ -41,14 +45,16 @@ def changed_hunks(repo: Path, sha: str) -> dict[str, list[Hunk]]:
     for file, lines in per_file.items():
         if file == "/dev/null" or not lines:
             continue
-        if lines and any(
-            line.startswith(("Binary files", "GIT binary patch")) for line in lines
-        ):
+        if lines and any(line.startswith(("Binary files", "GIT binary patch")) for line in lines):
             continue
         text = "\n".join(lines)
         hunks = [
-            Hunk(int(m.group(1)), int(m.group(2)) if m.group(2) else 1,
-                 int(m.group(3)), int(m.group(4)) if m.group(4) else 1)
+            Hunk(
+                int(m.group(1)),
+                int(m.group(2)) if m.group(2) else 1,
+                int(m.group(3)),
+                int(m.group(4)) if m.group(4) else 1,
+            )
             for m in HUNK_RE.finditer(text)
         ]
         hunks = [h for h in hunks if h.old_count > 0]
@@ -75,8 +81,17 @@ def blame_deleted_lines(repo: Path, sha: str) -> dict[str, list[str]]:
         try:
             for start, count in contiguous(rs):
                 text = _git(
-                    repo, "blame", "-w", "-C", "--first-parent", "--porcelain",
-                    "-L", f"{start},{start + count - 1}", f"{sha}^", "--", file
+                    repo,
+                    "blame",
+                    "-w",
+                    "-C",
+                    "--first-parent",
+                    "--porcelain",
+                    "-L",
+                    f"{start},{start + count - 1}",
+                    f"{sha}^",
+                    "--",
+                    file,
                 )
                 per_line.extend(_porcelain_shas(text)[:count])
         except subprocess.CalledProcessError:
@@ -104,8 +119,9 @@ def _porcelain_shas(text: str) -> list[str]:
     """One sha per blamed old line, in order, from git blame --porcelain v1."""
     shas: list[str] = []
     for line in text.splitlines():
-        if line.startswith(("\t", "author ", "committer ", "summary", "boundary",
-                            "filename ", "previous ")):
+        if line.startswith(
+            ("\t", "author ", "committer ", "summary", "boundary", "filename ", "previous ")
+        ):
             continue
         m = SHA_LINE_RE.match(line)
         if m:
