@@ -1,5 +1,6 @@
-"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report}. Requires the
-opencode CLI on PATH for classify (ADR-0001 rolling session)."""
+"""CLI: uv run skill-stats {init,walk,classify,detect,lineage,report,update}. Requires the
+opencode CLI on PATH for classify (ADR-0001 rolling session). update is the
+orchestrating verb (ADR-0003 clause 7); the stage subcommands stay plumbing."""
 
 import argparse
 import json
@@ -66,6 +67,18 @@ def main(argv: list[str] | None = None) -> None:
     rep.add_argument("--html", nargs="?", const="skill-stats-report.html", default=None)
     rep.add_argument("--out", default="skill-stats-report")
     rep.add_argument("--json", action="store_true")
+
+    up = sub.add_parser(
+        "update",
+        help="verify -> walk -> classify -> detect -> lineage -> live-lines ->"
+        " report -> serialize + digest",
+    )
+    up.add_argument("--db", default="skill-stats.db")
+    up.add_argument("--no-classify", action="store_true", help="skip LLM classification")
+    up.add_argument("--no-detect", action="store_true", help="skip blame-based fix detection")
+    up.add_argument("--no-lineage", action="store_true", help="skip lineage closure")
+    up.add_argument("--no-report", action="store_true", help="skip report.html regeneration")
+    up.add_argument("--no-serialize", action="store_true", help="skip artifact write")
 
     args = parser.parse_args(argv)
 
@@ -142,7 +155,107 @@ def main(argv: list[str] | None = None) -> None:
 
             html_path = write_report(conn, args.html)
             print(f"wrote {html_path}")
+    elif args.cmd == "update":
+        assert repo_dir is not None, "run init first"
+        _run_update(conn, repo_dir, settings, args)
     conn.close()
+
+
+def _pending_count(conn: sqlite3.Connection) -> int:
+    """Commits without a verdict row — the classification backlog."""
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) c FROM commits c LEFT JOIN commit_verdicts v"
+            " ON v.commit_id = c.id WHERE v.commit_id IS NULL"
+        ).fetchone()["c"]
+    )
+
+
+def _run_update(
+    conn: sqlite3.Connection, repo_dir: Path, settings: dict[str, Any], args: argparse.Namespace
+) -> None:
+    """One orchestrating run (ADR-0003 clause 7, Q11): verify the existing
+    artifact first, then walk -> classify -> detect -> lineage -> live-lines ->
+    report -> serialize + digest + verify. Deterministic stages always run;
+    classification is best-effort — when it cannot run the walked backlog stays
+    pending, is printed loudly, and reprocesses on a later successful update
+    (Q13). The exit code stays 0 with a backlog."""
+    from . import artifact, livelines
+    from .htmlreport import write_report
+
+    branch = settings.get("branch") or None
+    store = repo_dir / ".skill-stats"
+    art_path = store / "skill-stats.sql"
+
+    if art_path.exists():
+        err = artifact.verify(art_path)
+        # wave 3 adds the partial-recompute recovery; for now the verdict is
+        # loud and the rewrite below supersedes the (untrusted) file
+        print(f"artifact digest: {'ok' if err is None else 'MISMATCH (' + err + ')'}")
+    else:
+        print("artifact: none yet (first run)")
+
+    n = gitwalk.walk(repo_dir, conn, branch)
+    print(f"walked {n} new commits")
+
+    if not args.no_classify:
+        pending_before = _pending_count(conn)
+        try:
+            SESSION_DIR.mkdir(parents=True, exist_ok=True)
+            sid = settings.get("classify_session_id") or None
+            session = Session(settings.get("model", DEFAULT_MODEL), sid)
+            try:
+                done = classify_pending(
+                    repo_dir, conn, settings.get("model", DEFAULT_MODEL), session
+                )
+            finally:
+                if session.session_id:
+                    _set(conn, "classify_session_id", session.session_id)
+            print(f"classified {len(done)} commits")
+        except (OSError, RuntimeError, ValueError) as exc:
+            # ValueError covers bad model replies reaching apply_reply (cited
+            # unknown feature ids; JSONDecodeError is one). classify_pending
+            # aborts mid-loop: what landed stays counted, the raising commit
+            # and the rest wait for a later update (Q13), and nothing below is
+            # blocked. The `classify` plumbing verb keeps raising.
+            processed = pending_before - _pending_count(conn)
+            print(
+                f"WARNING: classification unavailable ({exc}); {processed} classified"
+                " before the abort, the rest stay pending and reprocess on a later"
+                " update"
+            )
+
+    if not args.no_detect:
+        n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))
+        print(f"annotated {n_fixes} fix commits")
+    if not args.no_lineage:
+        close_lineage(conn)
+        print("lineage closure updated")
+
+    live = livelines.update_live_lines(conn, repo_dir)
+    print(
+        f"live lines at {live.at_sha[:12] or '(none)'}: unattributed"
+        f" {live.unattributed_lines}, {live.samples_written} samples written"
+    )
+
+    if not args.no_report:
+        report_path = write_report(conn, store / "report.html")
+        print(f"wrote {report_path}")
+    if not args.no_serialize:
+        path = artifact.write(conn, repo_dir, with_report=False)
+        err = artifact.verify(path)
+        print(f"wrote {path} (digest {'ok' if err is None else 'MISMATCH ' + str(err)})")
+
+    total = conn.execute("SELECT COUNT(*) c FROM commits").fetchone()["c"]
+    classified = conn.execute("SELECT COUNT(*) c FROM commit_verdicts").fetchone()["c"]
+    pending = int(total) - int(classified)
+    suffix = "artifact updated" if not args.no_serialize else "artifact not written"
+    print(f"{total} walked, {classified} classified, {pending} pending, {suffix}")
+    if pending:
+        print(
+            f"WARNING: {pending} commits unclassified — backlog; a later successful"
+            " update reprocesses them"
+        )
 
 
 if __name__ == "__main__":

@@ -170,7 +170,7 @@ def churn_per_feature(conn: sqlite3.Connection) -> list[tuple[str, str, int]]:
 
 
 class FeatureRank(NamedTuple):
-    """One feature with its attributed-fix count and total churn (lines)."""
+    """One feature with its attributed-fix count, churn and live lines."""
 
     fid: str
     title: str
@@ -178,6 +178,7 @@ class FeatureRank(NamedTuple):
     fixes: int
     churn: int
     sha: str  # earliest defining commit sha
+    live: int  # features.live_lines at the latest live-lines run
 
 
 def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
@@ -200,9 +201,11 @@ def feature_ranking(conn: sqlite3.Connection) -> list[FeatureRank]:
             fixes=int(r["n"]),
             churn=int(churn.get(str(r["fid"]), 0)),
             sha=str(sha.get(r["fid"], "")),
+            live=int(r["live"]),
         )
         for r in conn.execute(
-            """SELECT f.id fid, f.title, f.created_at d, COUNT(ff.fix_commit_id) n
+            """SELECT f.id fid, f.title, f.created_at d, f.live_lines live,
+                      COUNT(ff.fix_commit_id) n
                FROM features f LEFT JOIN fixes_features ff ON ff.feature_id = f.id
                GROUP BY f.id ORDER BY n DESC, f.id"""
         )

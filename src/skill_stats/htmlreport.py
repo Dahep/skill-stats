@@ -110,7 +110,10 @@ def _repo_url(repo: str | None) -> str | None:
     try:
         out = subprocess.run(
             ["git", "-C", repo, "remote", "get-url", "origin"],
-            capture_output=True, text=True, check=True, timeout=10,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
@@ -129,11 +132,17 @@ def _repo_url(repo: str | None) -> str | None:
 
 # ------------------------------------------------------------- svg chars --
 
+
 def _dual_chart(
-    bars: list[float], labels: list[str], color: str,
-    line: list[float] | None = None, line_color: str = C["ratio"],
-    bar_name: str = "", line_name: str = "",
-    width: int = 920, height: int = 300,
+    bars: list[float],
+    labels: list[str],
+    color: str,
+    line: list[float] | None = None,
+    line_color: str = C["ratio"],
+    bar_name: str = "",
+    line_name: str = "",
+    width: int = 920,
+    height: int = 300,
 ) -> str:
     """Vertical bars with an optional line on its own right-hand scale."""
     if not bars and not line:
@@ -216,12 +225,173 @@ def _dual_chart(
     return (
         f'<div class="chartbox">{legend}'
         + f'<svg viewBox="0 0 {width} {height}" role="img" style="width:100%">'
-        + "".join(body) + "</svg></div>"
+        + "".join(body)
+        + "</svg></div>"
     )
 
 
+_LIVE_COLORS = [
+    "#9ece6a",
+    "#7aa2f7",
+    "#bb9af7",
+    "#e0af68",
+    "#73daca",
+    "#f7768e",
+    "#ff9e64",
+    "#c0caf5",
+]
+
+
+def _lines_chart(
+    labels: list[str],
+    series: list[tuple[str, list[float | None], str]],
+    total: tuple[str, list[float | None], str],
+) -> str:
+    """One polyline per feature plus an emphasized total line on a shared
+    scale. A None value is a gap (no sample), never a zero: the line breaks
+    instead of inventing a measurement."""
+    w, h, pad_l, pad_r, pad_t, pad_b = 920, 300, 56, 18, 20, 44
+    pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
+    all_series = series + [total]
+    ymax = (
+        max((v for _, vals, _ in all_series for v in vals if v is not None), default=0.0) * 1.08
+        or 1.0
+    )
+    n = max(1, len(labels))
+    body = [f'<rect width="{w}" height="{h}" fill="{C["card"]}" rx="8"/>']
+    for k in range(5):
+        frac = k / 4
+        y = pad_t + ph * (1 - frac)
+        body.append(
+            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{w - pad_r}" y2="{y:.1f}"'
+            f' stroke="{C["grid"]}" stroke-width="1"/>'
+            f'<text x="{pad_l - 8}" y="{y + 3.5:.1f}" class="tick"'
+            f' text-anchor="end">{ymax * frac:.4g}</text>'
+        )
+
+    def sx(i: int) -> float:
+        return pad_l + (i + 0.5) * pw / n
+
+    def sy(v: float) -> float:
+        return pad_t + ph * (1 - v / ymax)
+
+    for name, vals, color in all_series:
+        width = 2.6 if name == total[0] else 1.6
+        for seg in _segments(vals):
+            pts = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in seg)
+            body.append(
+                f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="{width}"/>'
+            )
+            body.extend(
+                f'<circle cx="{sx(i):.1f}" cy="{sy(v):.1f}" r="2.2" fill="{color}"/>'
+                for i, v in seg
+            )
+    step = max(1, len(labels) // 11)
+    for i in range(0, len(labels), step):
+        body.append(
+            f'<text x="{sx(i):.1f}" y="{h - 18}" class="tick"'
+            f' text-anchor="middle">{_esc(labels[i])}</text>'
+        )
+    legend = "".join(
+        f'<span style="display:inline-block;width:12px;height:2px;background:{color}"></span>'
+        f"&nbsp;{_esc(name)}&nbsp;&nbsp;"
+        for name, _, color in all_series
+    )
+    return (
+        f'<div class="chartbox"><div class="legend">{legend}</div>'
+        f'<svg viewBox="0 0 {w} {h}" role="img" style="width:100%">'
+        + "".join(body)
+        + "</svg></div>"
+    )
+
+
+def _segments(vals: list[float | None]) -> list[list[tuple[int, float]]]:
+    """Contiguous non-gap runs of (index, value) — gaps break the line."""
+    segs: list[list[tuple[int, float]]] = []
+    cur: list[tuple[int, float]] = []
+    for i, v in enumerate(vals):
+        if v is None:
+            if cur:
+                segs.append(cur)
+                cur = []
+        else:
+            cur.append((i, v))
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def _live_size_section(conn: sqlite3.Connection, unattributed: int | None, complete: bool) -> str:
+    """Feature size over time from feature_line_samples; empty (graceful
+    omission) when the live-lines stage has not produced samples yet. While
+    the backfill is incomplete (backfill_state), absent samples render as gaps
+    — zero-filling would present unknown history as measurements."""
+    rows = conn.execute(
+        """SELECT s.at_commit_sha sha, s.feature_id fid, s.live_lines n, c.committed_at d
+           FROM feature_line_samples s JOIN commits c ON c.sha = s.at_commit_sha
+           ORDER BY c.walk_index"""
+    ).fetchall()
+    if not rows:
+        return ""
+    order: list[tuple[str, str]] = []
+    totals: dict[str, float] = {}
+    per: dict[str, dict[str, float]] = {}
+    for r in rows:
+        sha = str(r["sha"])
+        if sha not in totals:
+            order.append((sha, str(r["d"])[:10]))
+            totals[sha] = 0.0
+        totals[sha] += float(r["n"])
+        per.setdefault(str(r["fid"]), {})[sha] = float(r["n"])
+    top = conn.execute(
+        "SELECT id, title FROM features ORDER BY live_lines DESC, id LIMIT 8"
+    ).fetchall()
+    labels = [lbl for _, lbl in order]
+
+    def values_for(fid: str) -> list[float | None]:
+        # complete history: a defined-but-empty feature measures 0;
+        # incomplete: absent samples are unknown -> gaps, never zeros
+        per_f = per.get(fid, {})
+        return [(per_f.get(sha, 0.0) if complete else per_f.get(sha)) for sha, _ in order]
+
+    series = [
+        (f"#{f['id']} {f['title']}", values_for(str(f["id"])), _LIVE_COLORS[i % len(_LIVE_COLORS)])
+        for i, f in enumerate(top)
+    ]
+    total: tuple[str, list[float | None], str] = (
+        "total attributed lines",
+        [totals[sha] for sha, _ in order],
+        C["muted"],
+    )
+    note = (
+        "Every line at the Target-branch tip is owned by exactly one commit; commit "
+        "lines accrue to the features the commit defines or touches, and fix lines "
+        "through the lineage closure (a commit claimed by two features counts in both, "
+        "so attributed totals can exceed the repository's line count). Top "
+        f"{len(series)} features by live lines; one Sample per (feature, commit) — "
+        "the backfill curve at adoption, then one forward sample per update."
+    )
+    if not complete:
+        note += (
+            " Sampling incomplete — backfill in progress; gaps in the curves are unknown, not zero."
+        )
+    if unattributed is not None:
+        note += (
+            f" {unattributed} tip line{'' if unattributed == 1 else 's'} unattributed"
+            " (introducing commit outside the walk)."
+        )
+    return f"""<section>
+<h2>Feature size over time</h2>
+<div class="note">{note}</div>
+{_lines_chart(labels, series, total)}
+</section>"""
+
+
 def _hbars(
-    pairs: list[tuple[str, float]], color: str, unit: str, cutoff: int = 40,
+    pairs: list[tuple[str, float]],
+    color: str,
+    unit: str,
+    cutoff: int = 40,
 ) -> str:
     w, pad_l, pad_t, row_h = 920, 300, 18, 27
     height = pad_t + len(pairs) * row_h + 12
@@ -242,7 +412,7 @@ def _hbars(
     return (
         f'<svg viewBox="0 0 {w} {height}" style="width:100%">'
         f'<rect width="{w}" height="{height}" fill="{C["card"]}" rx="8"/>'
-        f'{"".join(rows)}</svg>'
+        f"{''.join(rows)}</svg>"
     )
 
 
@@ -282,6 +452,7 @@ def _donut(counts: list[tuple[str, int, str]]) -> str:
 
 # --------------------------------------------------------------- layout ---
 
+
 def _kpi(label: str, value: str, sub: str = "") -> str:
     sub_html = f'<div class="kpi-sub">{_esc(sub)}</div>' if sub else ""
     return (
@@ -317,23 +488,29 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     ranking = feature_ranking(conn)
     hbars_fixes = _hbars(
         [(f"#{r.fid} {r.title}", r.fixes) for r in ranking[:top]],
-        C["fix"], "fixes",
+        C["fix"],
+        "fixes",
     )
 
     kpis = (
         _kpi("commits walked", str(snap.total_commits), sub=f"span {span}")
-        + _kpi("features", str(snap.total_features),
-               sub=f"{snap.features_per_year:.1f} / year")
-        + _kpi("fixes", str(snap.total_fixes),
-               sub=f"{snap.fixes_per_feature:.2f} per feature")
-        + _kpi("top feature fixes", str(snap.top_features_by_fixes[0][2])
-               if snap.top_features_by_fixes else "0",
-               sub=snap.top_features_by_fixes[0][1] if snap.top_features_by_fixes else "")
-        + _kpi("peak rolling fixes/features",
-               f"{max((p.fixes_per_feature for p in rolling), default=0.0):.2f}",
-               sub="1-month trailing window")
-        + _kpi("fixes w/o target", str(snap.fixes_uncovered),
-               sub="fix commits attributed to no feature")
+        + _kpi("features", str(snap.total_features), sub=f"{snap.features_per_year:.1f} / year")
+        + _kpi("fixes", str(snap.total_fixes), sub=f"{snap.fixes_per_feature:.2f} per feature")
+        + _kpi(
+            "top feature fixes",
+            str(snap.top_features_by_fixes[0][2]) if snap.top_features_by_fixes else "0",
+            sub=snap.top_features_by_fixes[0][1] if snap.top_features_by_fixes else "",
+        )
+        + _kpi(
+            "peak rolling fixes/features",
+            f"{max((p.fixes_per_feature for p in rolling), default=0.0):.2f}",
+            sub="1-month trailing window",
+        )
+        + _kpi(
+            "fixes w/o target",
+            str(snap.fixes_uncovered),
+            sub="fix commits attributed to no feature",
+        )
     )
 
     def percent(x: int) -> float:
@@ -341,25 +518,41 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
 
     # ---------------------------------------------------------- pieces ----
     features_growth = _dual_chart(
-        [float(p.features_new) for p in tl], months, C["feature"],
-        line=[float(p.features_cumulative) for p in tl], line_color=C["cumulative"],
-        bar_name="new features / month", line_name="features in total",
+        [float(p.features_new) for p in tl],
+        months,
+        C["feature"],
+        line=[float(p.features_cumulative) for p in tl],
+        line_color=C["cumulative"],
+        bar_name="new features / month",
+        line_name="features in total",
     )
     fixes_roller = _dual_chart(
-        [float(p.fixes_window) for p in rolling], roll_labels, C["fix"],
-        line=[p.fixes_per_feature for p in rolling], line_color=C["ratio"],
-        bar_name="fixes in trailing 30d", line_name="fixes / feature",
+        [float(p.fixes_window) for p in rolling],
+        roll_labels,
+        C["fix"],
+        line=[p.fixes_per_feature for p in rolling],
+        line_color=C["ratio"],
+        bar_name="fixes in trailing 30d",
+        line_name="fixes / feature",
     )
     commits_month = _dual_chart(
-        [float(p.commits) for p in tl], months, C["neutral"],
-        line=[float(p.fixes) for p in tl], line_color=C["fix"],
-        bar_name="commits / month", line_name="fixes / month",
+        [float(p.commits) for p in tl],
+        months,
+        C["neutral"],
+        line=[float(p.fixes) for p in tl],
+        line_color=C["fix"],
+        bar_name="commits / month",
+        line_name="fixes / month",
     )
     verdict_counts = [
         (v, snap.verdict_counts.get(v, 0), col)
         for v, col in (
-            ("feature", C["feature"]), ("fix", C["fix"]), ("refactor", C["neutral"]),
-            ("revert", C["churn"]), ("cleanup", C["cumulative"]), ("unknown", C["muted"]),
+            ("feature", C["feature"]),
+            ("fix", C["fix"]),
+            ("refactor", C["neutral"]),
+            ("revert", C["churn"]),
+            ("cleanup", C["cumulative"]),
+            ("unknown", C["muted"]),
         )
     ]
     donut = _donut(verdict_counts)
@@ -374,19 +567,25 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         rank_rows.append(
             f"<tr><td class='num'>{i}</td><td>#{r.fid} &nbsp;{_esc(r.title)}</td>"
             f"<td class='num'>{r.created}</td><td class='num'>{r.fixes}</td>"
-            f"<td class='num'>{r.churn}</td><td>{link}</td></tr>"
+            f"<td class='num'>{r.churn}</td><td class='num'>{r.live}</td><td>{link}</td></tr>"
         )
     rank_table = (
         "<table><thead><tr>"
         "<th class='num'>#</th><th>Feature</th><th class='num'>Created</th>"
         "<th class='num'>Fixes</th><th class='num'>Churn (lines)</th>"
-        "<th>First commit</th></tr></thead><tbody>"
-        + "".join(rank_rows) + "</tbody></table>"
+        "<th class='num'>Live lines</th>"
+        "<th>First commit</th></tr></thead><tbody>" + "".join(rank_rows) + "</tbody></table>"
+    )
+
+    unattr_raw = settings.get("unattributed_lines")
+    backfill_state = settings.get("backfill_state")
+    complete = isinstance(backfill_state, dict) and backfill_state.get("status") == "done"
+    live_section = _live_size_section(
+        conn, int(unattr_raw) if unattr_raw is not None else None, complete
     )
 
     churn_rows = [
-        f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td>"
-        f"<td class='num'>{n}</td></tr>"
+        f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td><td class='num'>{n}</td></tr>"
         for i, (fid, title, n) in enumerate(snap.top_features_by_churn, 1)
     ]
     churn_table = (
@@ -395,10 +594,7 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
         "<tbody>" + "".join(churn_rows) + "</tbody></table>"
     )
 
-    who = (
-        f"{_esc(repo_name)} <span class='muted'>({_esc(branch)})</span>"
-        f" — {_esc(model)}"
-    )
+    who = f"{_esc(repo_name)} <span class='muted'>({_esc(branch)})</span> — {_esc(model)}"
     other_pct = percent(
         snap.verdict_counts.get("revert", 0)
         + snap.verdict_counts.get("cleanup", 0)
@@ -443,6 +639,8 @@ per feature it reaches. The table covers all {len(ranking)} features.</div>
 {hbars_fixes}
 {rank_table}
 </section>
+
+{live_section}
 
 <section>
 <h2>Other gathered data</h2>
