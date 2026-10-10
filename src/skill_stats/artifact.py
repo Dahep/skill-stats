@@ -43,7 +43,13 @@ FORMAT = 1
 DIGEST_BLANK = "-- digest:"
 _DIGEST_LINE_RE = re.compile(rb"^-- digest:(?: ([0-9a-f]+))?$", re.M)
 
-_SETTINGS_WHITELIST = ("branch", "min_target_lines", "model", "unattributed_lines")
+_SETTINGS_WHITELIST = (
+    "backfill_state",
+    "branch",
+    "min_target_lines",
+    "model",
+    "unattributed_lines",
+)
 
 
 @dataclass(frozen=True)

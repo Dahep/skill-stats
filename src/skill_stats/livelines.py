@@ -65,7 +65,10 @@ def sample_points(walk_indexes: list[int]) -> list[int]:
 
 def update_live_lines(conn: sqlite3.Connection, repo_dir: Path) -> LiveLineResult:
     """Measure per-feature live lines at the tip, refresh features.live_lines,
-    and write Sample rows (backfill sweep first when the table is empty)."""
+    and write Sample rows. The backfill sweep runs until its history is
+    trustworthy (backfill_state): first run, after an interrupted sweep, or
+    after new classification landed (late-created features gain their
+    historical samples)."""
     row = conn.execute("SELECT sha FROM commits ORDER BY walk_index DESC LIMIT 1").fetchone()
     if not row:
         return LiveLineResult("", 0, 0, 0)
@@ -76,14 +79,15 @@ def update_live_lines(conn: sqlite3.Connection, repo_dir: Path) -> LiveLineResul
 
     samples_written = 0
     backfilled_points = 0
-    have_samples = conn.execute("SELECT COUNT(*) c FROM feature_line_samples").fetchone()["c"]
-    if not have_samples and alive:
+    have_samples = bool(conn.execute("SELECT COUNT(*) c FROM feature_line_samples").fetchone()["c"])
+    if alive and _needs_backfill(conn, have_samples):
         by_index = {int(r["walk_index"]): str(r["sha"]) for r in plan}
         for idx in sample_points(sorted(by_index)):
             sha = by_index[idx]
             per_feature, _ = _attribute(conn, *_line_counts_at(repo_dir, sha))
             samples_written += _write_sample(conn, sha, alive, walk_of[sha], per_feature)
             backfilled_points += 1
+        _record_backfill_state(conn)  # completeness tracked, never assumed
 
     per_feature, unattributed = _attribute(conn, *_line_counts_at(repo_dir, tip))
     with conn:
@@ -98,6 +102,61 @@ def update_live_lines(conn: sqlite3.Connection, repo_dir: Path) -> LiveLineResul
     samples_written += _write_sample(conn, tip, alive, walk_of[tip], per_feature)
     conn.commit()
     return LiveLineResult(tip, unattributed, samples_written, backfilled_points)
+
+
+def _backfill_state(conn: sqlite3.Connection) -> dict[str, object] | None:
+    row = conn.execute("SELECT value FROM settings WHERE key = 'backfill_state'").fetchone()
+    if not row:
+        return None
+    try:
+        state = json.loads(row["value"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _max_classified_walk(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """SELECT MAX(c.walk_index) w FROM commits c
+           JOIN commit_verdicts v ON v.commit_id = c.id"""
+    ).fetchone()
+    return int(row["w"] or 0)
+
+
+def _needs_backfill(conn: sqlite3.Connection, have_samples: bool) -> bool:
+    """The sweep re-runs until its history is trustworthy: no samples yet, no
+    recorded completed sweep, or new classification landed after the last one
+    (features created late must gain their historical samples)."""
+    if not have_samples:
+        return True
+    state = _backfill_state(conn)
+    if state is None or state.get("status") != "done":
+        return True
+    recorded = state.get("max_classified_walk_index", 0)
+    if not isinstance(recorded, int):
+        return True  # unknown/partial state: re-sweep is the safe side
+    return _max_classified_walk(conn) > recorded
+
+
+def _record_backfill_state(conn: sqlite3.Connection) -> None:
+    """End of a sweep: record completeness honestly. With a classification
+    backlog outstanding the status stays pending (later runs re-sweep once the
+    backlog clears); a fully classified walk marks the sweep done."""
+    pending = int(
+        conn.execute(
+            "SELECT COUNT(*) c FROM commits c LEFT JOIN commit_verdicts v"
+            " ON v.commit_id = c.id WHERE v.commit_id IS NULL"
+        ).fetchone()["c"]
+    )
+    state = {
+        "status": "done" if pending == 0 else "pending",
+        "max_classified_walk_index": _max_classified_walk(conn),
+    }
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('backfill_state', ?)",
+            (json.dumps(state),),
+        )
 
 
 def _defining_walks(conn: sqlite3.Connection) -> dict[str, int]:

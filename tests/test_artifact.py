@@ -158,7 +158,7 @@ def test_artifact_materializes_standalone_with_committed_shapes(tmp_path, repo):
     assert (diff[0]["added_lines"], diff[0]["deleted_lines"]) == (2, 0)
     assert mat.execute("SELECT COUNT(*) c FROM feature_line_samples").fetchone()["c"] > 0
     keys = {r["key"] for r in mat.execute("SELECT key FROM settings")}
-    assert keys <= {"branch", "model", "min_target_lines", "unattributed_lines"}
+    assert keys <= {"backfill_state", "branch", "model", "min_target_lines", "unattributed_lines"}
     assert (
         mat.execute("SELECT COUNT(*) c FROM commit_verdicts WHERE run_id IS NOT NULL").fetchone()[
             "c"

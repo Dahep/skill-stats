@@ -1,7 +1,10 @@
 """Live-lines tests: tip attribution, fix-through-lineage accrual, renames,
 unattributed counting, Sample backfill (full sweep + capped plan)."""
 
+import json
 import subprocess
+
+import pytest
 
 from conftest import add_feature, commit_files, make_db, run
 from skill_stats.blame import _porcelain_shas
@@ -129,11 +132,12 @@ def test_update_live_lines_is_idempotent(repo, tmp_path):
     walk(repo, conn, "main")
     fa = add_feature(conn, "feature a")
     _define(conn, fa, h1)
+    _verdict(conn, h1, "feature")  # classified: the sweep may complete
     conn.commit()
     update_live_lines(conn, repo)
     before = set(conn.execute("SELECT * FROM feature_line_samples"))
     res2 = update_live_lines(conn, repo)
-    assert res2.backfilled_points == 0  # samples already exist -> no re-sweep
+    assert res2.backfilled_points == 0  # samples already complete -> no re-sweep
     assert set(conn.execute("SELECT * FROM feature_line_samples")) == before
 
 
@@ -241,3 +245,154 @@ def test_merge_brought_lines_attribute_to_the_merge_commit(repo, tmp_path):
     # (which the walk includes) -> its features; nothing goes unattributed
     assert res.unattributed_lines == 0
     assert dict(conn.execute("SELECT id, live_lines FROM features")) == {fm: 2}
+
+
+# ------------------------------------------- backfill trust + report wording --
+
+
+def _state(conn):
+    row = conn.execute("SELECT value FROM settings WHERE key = 'backfill_state'").fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def _verdicted_feature_repo(repo, tmp_path):
+    """h1/h2 both classified (no backlog), each defining one feature."""
+    h1 = commit_files(repo, "first", {"f.txt": "a1\na2\n"})
+    h2 = commit_files(repo, "second", {"g.txt": "b1\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    fa = add_feature(conn, "feature a")
+    fb = add_feature(conn, "feature b")
+    _define(conn, fa, h1)
+    _define(conn, fb, h2)
+    _verdict(conn, h1, "feature")
+    _verdict(conn, h2, "feature")
+    conn.commit()
+    return conn, fa, fb, h1, h2
+
+
+def test_backfill_resumes_after_interruption(repo, tmp_path, monkeypatch):
+    conn, fa, fb, h1, h2 = _verdicted_feature_repo(repo, tmp_path)
+    import skill_stats.livelines as livelines
+
+    real = livelines._line_counts_at
+    calls = {"n": 0, "boom": True}
+
+    def flaky(repo_dir, sha):
+        calls["n"] += 1
+        if calls["boom"] and calls["n"] == 2:
+            raise RuntimeError("injected sweep failure")
+        return real(repo_dir, sha)
+
+    monkeypatch.setattr(livelines, "_line_counts_at", flaky)
+    with pytest.raises(RuntimeError, match="injected"):
+        update_live_lines(conn, repo)
+    assert _state(conn) is None  # interrupted sweep records no completeness
+
+    calls["boom"] = False
+    res = update_live_lines(conn, repo)  # a normal update resumes the sweep
+    assert res.backfilled_points == 2
+    assert _state(conn) == {"status": "done", "max_classified_walk_index": 2}
+    points = {r[0] for r in conn.execute("SELECT at_commit_sha FROM feature_line_samples")}
+    assert points == {h1, h2}
+    conn.close()
+
+
+def test_backfill_resweeps_for_late_classification(repo, tmp_path):
+    h1 = commit_files(repo, "first", {"f.txt": "a1\na2\n"})
+    h2 = commit_files(repo, "second", {"g.txt": "b1\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    # classify only h2 first: h1 stays pending -> the sweep cannot complete
+    fb = add_feature(conn, "feature b")
+    _define(conn, fb, h2)
+    _verdict(conn, h2, "feature")
+    conn.commit()
+    res = update_live_lines(conn, repo)
+    assert res.backfilled_points == 2
+    assert _state(conn)["status"] == "pending"  # backlog keeps trust pending
+
+    # classify h1 late: the feature defined at the old commit must gain its
+    # historical sample points via a re-sweep
+    fa = add_feature(conn, "feature a")
+    _define(conn, fa, h1)
+    _verdict(conn, h1, "feature")
+    conn.commit()
+    res2 = update_live_lines(conn, repo)
+    assert res2.backfilled_points == 2  # re-swept
+    rows = {
+        (r["feature_id"], r["at_commit_sha"])
+        for r in conn.execute("SELECT feature_id, at_commit_sha FROM feature_line_samples")
+    }
+    assert (fa, h1) in rows and (fa, h2) in rows
+    assert _state(conn) == {"status": "done", "max_classified_walk_index": 2}
+    conn.close()
+
+
+def test_backfill_done_state_is_stable(repo, tmp_path):
+    conn, fa, fb, h1, h2 = _verdicted_feature_repo(repo, tmp_path)
+    update_live_lines(conn, repo)
+    assert _state(conn)["status"] == "done"
+    before = set(conn.execute("SELECT * FROM feature_line_samples"))
+    res = update_live_lines(conn, repo)  # no new classification -> no re-sweep
+    assert res.backfilled_points == 0
+    assert set(conn.execute("SELECT * FROM feature_line_samples")) == before
+    conn.close()
+
+
+def test_known_commit_without_links_is_neither_feature_nor_unattributed(repo, tmp_path):
+    h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
+    h2 = commit_files(repo, "cleanup", {"k.txt": "k1\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    fa = add_feature(conn, "feature a")
+    _define(conn, fa, h1)
+    _verdict(conn, h1, "feature")
+    _verdict(conn, h2, "cleanup")  # known + classified, but claims no feature
+    conn.commit()
+    res = update_live_lines(conn, repo)
+    assert res.unattributed_lines == 0  # unattributed = introducing commit UNKNOWN
+    # k.txt's line accrues to no feature — it is neither counted nor dropped
+    # from the tip: it simply belongs to no feature
+    assert dict(conn.execute("SELECT id, live_lines FROM features")) == {fa: 2}
+    conn.close()
+
+
+def test_report_marks_incomplete_sampling_and_renames_total(repo, tmp_path):
+    from skill_stats import htmlreport
+
+    h1 = commit_files(repo, "first", {"f.txt": "a1\na2\n"})
+    h2 = commit_files(repo, "second", {"g.txt": "b1\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    fa = add_feature(conn, "feature a")
+    fb = add_feature(conn, "feature b")
+    _define(conn, fa, h1)
+    _define(conn, fb, h2)
+    conn.commit()
+    update_live_lines(conn, repo)  # no verdicts -> backlog -> state pending
+    page = htmlreport.build(conn)
+    assert "total attributed lines" in page  # renamed total
+    assert "can exceed" in page  # multi-feature claims can exceed repo size
+    assert "sampling incomplete" in page.lower()
+    assert "unknown, not zero" in page
+
+    _verdict(conn, h1, "feature")
+    _verdict(conn, h2, "feature")
+    conn.commit()
+    update_live_lines(conn, repo)  # backlog cleared -> sweep completes
+    page2 = htmlreport.build(conn)
+    assert "sampling incomplete" not in page2.lower()
+    conn.close()
+
+
+def test_chart_draws_gaps_not_zeros_when_incomplete():
+    from skill_stats import htmlreport
+
+    chart = htmlreport._lines_chart(
+        ["a", "b", "c"], [("s", [1.0, None, 3.0], "#123456")], ("t", [1.0, 1.0, 3.0], "#654321")
+    )
+    # the gapped series renders as two segments (values only where samples
+    # exist), never as a zero-filled line
+    assert chart.count('stroke="#123456"') == 2
+    assert chart.count('stroke="#654321"') == 1

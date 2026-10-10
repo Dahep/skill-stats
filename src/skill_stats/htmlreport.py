@@ -244,14 +244,19 @@ _LIVE_COLORS = [
 
 def _lines_chart(
     labels: list[str],
-    series: list[tuple[str, list[float], str]],
-    total: tuple[str, list[float], str],
+    series: list[tuple[str, list[float | None], str]],
+    total: tuple[str, list[float | None], str],
 ) -> str:
-    """One polyline per feature plus an emphasized total line on a shared scale."""
+    """One polyline per feature plus an emphasized total line on a shared
+    scale. A None value is a gap (no sample), never a zero: the line breaks
+    instead of inventing a measurement."""
     w, h, pad_l, pad_r, pad_t, pad_b = 920, 300, 56, 18, 20, 44
     pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
     all_series = series + [total]
-    ymax = max((v for _, vals, _ in all_series for v in vals), default=0.0) * 1.08 or 1.0
+    ymax = (
+        max((v for _, vals, _ in all_series for v in vals if v is not None), default=0.0) * 1.08
+        or 1.0
+    )
     n = max(1, len(labels))
     body = [f'<rect width="{w}" height="{h}" fill="{C["card"]}" rx="8"/>']
     for k in range(5):
@@ -271,11 +276,16 @@ def _lines_chart(
         return pad_t + ph * (1 - v / ymax)
 
     for name, vals, color in all_series:
-        pts = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in enumerate(vals))
         width = 2.6 if name == total[0] else 1.6
-        body.append(
-            f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="{width}"/>'
-        )
+        for seg in _segments(vals):
+            pts = " ".join(f"{sx(i):.1f},{sy(v):.1f}" for i, v in seg)
+            body.append(
+                f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="{width}"/>'
+            )
+            body.extend(
+                f'<circle cx="{sx(i):.1f}" cy="{sy(v):.1f}" r="2.2" fill="{color}"/>'
+                for i, v in seg
+            )
     step = max(1, len(labels) // 11)
     for i in range(0, len(labels), step):
         body.append(
@@ -295,9 +305,27 @@ def _lines_chart(
     )
 
 
-def _live_size_section(conn: sqlite3.Connection, unattributed: int | None) -> str:
+def _segments(vals: list[float | None]) -> list[list[tuple[int, float]]]:
+    """Contiguous non-gap runs of (index, value) — gaps break the line."""
+    segs: list[list[tuple[int, float]]] = []
+    cur: list[tuple[int, float]] = []
+    for i, v in enumerate(vals):
+        if v is None:
+            if cur:
+                segs.append(cur)
+                cur = []
+        else:
+            cur.append((i, v))
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def _live_size_section(conn: sqlite3.Connection, unattributed: int | None, complete: bool) -> str:
     """Feature size over time from feature_line_samples; empty (graceful
-    omission) when the live-lines stage has not produced samples yet."""
+    omission) when the live-lines stage has not produced samples yet. While
+    the backfill is incomplete (backfill_state), absent samples render as gaps
+    — zero-filling would present unknown history as measurements."""
     rows = conn.execute(
         """SELECT s.at_commit_sha sha, s.feature_id fid, s.live_lines n, c.committed_at d
            FROM feature_line_samples s JOIN commits c ON c.sha = s.at_commit_sha
@@ -319,22 +347,34 @@ def _live_size_section(conn: sqlite3.Connection, unattributed: int | None) -> st
         "SELECT id, title FROM features ORDER BY live_lines DESC, id LIMIT 8"
     ).fetchall()
     labels = [lbl for _, lbl in order]
+
+    def values_for(fid: str) -> list[float | None]:
+        # complete history: a defined-but-empty feature measures 0;
+        # incomplete: absent samples are unknown -> gaps, never zeros
+        per_f = per.get(fid, {})
+        return [(per_f.get(sha, 0.0) if complete else per_f.get(sha)) for sha, _ in order]
+
     series = [
-        (
-            f"#{f['id']} {f['title']}",
-            [per.get(str(f["id"]), {}).get(sha, 0.0) for sha, _ in order],
-            _LIVE_COLORS[i % len(_LIVE_COLORS)],
-        )
+        (f"#{f['id']} {f['title']}", values_for(str(f["id"])), _LIVE_COLORS[i % len(_LIVE_COLORS)])
         for i, f in enumerate(top)
     ]
-    total = ("total live lines", [totals[sha] for sha, _ in order], C["muted"])
+    total: tuple[str, list[float | None], str] = (
+        "total attributed lines",
+        [totals[sha] for sha, _ in order],
+        C["muted"],
+    )
     note = (
         "Every line at the Target-branch tip is owned by exactly one commit; commit "
         "lines accrue to the features the commit defines or touches, and fix lines "
-        "through the lineage closure (a commit claimed by two features counts in "
-        f"both). Top {len(series)} features by live lines; one Sample per (feature, "
-        "commit) — the backfill curve at adoption, then one forward sample per update."
+        "through the lineage closure (a commit claimed by two features counts in both, "
+        "so attributed totals can exceed the repository's line count). Top "
+        f"{len(series)} features by live lines; one Sample per (feature, commit) — "
+        "the backfill curve at adoption, then one forward sample per update."
     )
+    if not complete:
+        note += (
+            " Sampling incomplete — backfill in progress; gaps in the curves are unknown, not zero."
+        )
     if unattributed is not None:
         note += (
             f" {unattributed} tip line{'' if unattributed == 1 else 's'} unattributed"
@@ -538,7 +578,11 @@ def build(conn: sqlite3.Connection, top: int = 15) -> str:
     )
 
     unattr_raw = settings.get("unattributed_lines")
-    live_section = _live_size_section(conn, int(unattr_raw) if unattr_raw is not None else None)
+    backfill_state = settings.get("backfill_state")
+    complete = isinstance(backfill_state, dict) and backfill_state.get("status") == "done"
+    live_section = _live_size_section(
+        conn, int(unattr_raw) if unattr_raw is not None else None, complete
+    )
 
     churn_rows = [
         f"<tr><td class='num'>{i}</td><td>#{fid} {_esc(title)}</td><td class='num'>{n}</td></tr>"
