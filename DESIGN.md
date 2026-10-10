@@ -45,6 +45,68 @@ matplotlib scripts over SQL queries. Build git-only phase first.
 - **User metrics**: dropped for now (single human, 5 author-strings). Author
 - normalization is out of scope.
 
+## Artifact & multi-repo (settled grill 2, ADR-0003)
+
+- **Artifact**: each Target repo commits `.skill-stats/` — the whole
+  analysis state as a deterministic SQL text snapshot (one INSERT per row,
+  whole DB every version) + digest (sha256 over the file) + `covered_through`
+  marker + regenerated standard HTML report. Raw diff text, `runs`, and
+  machine-local settings stay out of the artifact; the walk instead stores
+  per-commit `added_lines`/`deleted_lines`/`churn_lines`.
+- **Exclusion**: `.skill-stats/**` paths only (no blanket hidden-dir rule).
+  Walk skips commits whose stripped diff is empty; mixed commits get
+  artifact paths stripped; blame parsing ignores store paths. Submodules
+  need no handling today: parent diffs show gitlink lines (they count
+  toward churn as one-line diff entries) and blame never descends into
+  submodule content; a submodule can later be analyzed as its own Target
+  repo.
+- **Identity**: `Repository key` = clone URL + Target branch — machine-local
+  paths are never identity. Feature ids become repo-prefixed strings
+  (`{repo-slug}-{fid}`), so gathered unions need no id remapping.
+- **Feature size**: per-feature `live_lines` = blame at the Target-branch
+  tip, every line owned by exactly one commit; fix-owned lines accrue to
+  the features the fix targets (via fix lineage); a commit claimed by two
+  features counts its lines in both. History: full-sweep backfill of the
+  curve at adoption, sampled past a size cap.
+- **Update verb**: `skill-stats update` = verify digest → walk → classify →
+  detect → lineage → live-lines (backfill + tip) → report → serialize +
+  digest, with flags (`--no-classify` etc.) trimming stages for dev/debug.
+  Stage subcommands remain plumbing. Lineage runs before live-lines: fix
+  lines accrue to features through the closure, which must exist first.
+- **Feature size**: per-feature `live_lines` = blame at the Target-branch
+  tip, every line owned by exactly one commit; fix-owned lines accrue to
+  the features the fix targets (via fix lineage); a commit claimed by two
+  features counts its lines in both. Samples store
+  (feature_id, at_commit_sha, live_lines) rows — forward samples every
+  update, backfill generates the same row family at adoption (full sweep,
+  sampled past a size cap); historical samples attribute fix lines with the
+  closure data as-of that sample.
+- **Identity**: `Repository key` = clone URL + Target branch — machine-local
+  paths are never identity. Feature ids become repo-prefixed strings
+  (`{repo-slug}-{fid}`), and commits are keyed by `(repo, sha)` (migration
+  step 1 carries the attribution tables along), so gathered unions need no
+  id remapping. Analyzing one repo on two Target branches is unsupported —
+  gather fails with a clear error rather than renaming colliding ids.
+- **Integrity policy**: verify on every update/gather; tamper → partial
+  recompute anchored at the newest digest-verifying version in the
+  artifact's own git history (reclassify commits after its coverage
+  horizon); full recompute only when history was rewritten so no trusted
+  version survives.
+- **CI**: runs update on every push to the Target branch; the trigger set is
+  configurable (every push, scheduled, or selected pushes) and never forces
+  a landing — no-op updates push nothing. Stale runs: a newer push triggers
+  its own run, whose artifact is cumulative, so a lagging run's landing is
+  dropped with a visible neutral status (excluding by fast-forward check);
+  superseded runs never block the pushes they trail and never rewrite
+  history. Deterministic stages always run; classification best-effort with
+  the backlog marked and reprocessed by a later run; artifact lands as a
+  distinct commit parented on the push, pushed with `GITHUB_TOKEN` (ring
+  closed by exclusion); report also uploaded as an Actions artifact; Pages
+  publishing gated on public/paid repos.
+- **Gather (designed, not built)**: ingests N artifacts into a union DB keyed
+  by Repository key; union DB is structurally identical to any single-repo
+  DB, so the report code path reads either unchanged.
+
 ## opencode pipeline (schema settled now, built later)
 
 - New threads only: analysis covers sessions created after the plugin exists;

@@ -6,16 +6,18 @@ A tool that mines git history (and later opencode history) to measure feature-le
 
 ### Git domain
 
-**Feature**:
-A coherent unit of change in a repository, identified by grouping commits (title, message, diff) and classified by an LLM into a canonical feature title, stored in a features table.
-_Avoid_: enhancement, ticket
+**Repository key**:
+A Target repo's identity across machines and clones: clone URL plus the repository's Target branch. Machine-local paths are never identity; Gather keys on a Repository key, two clones of the same repository are one.
+
+**Feature id**:
+A Feature's identifier. Locally unique within a repo; globally disambiguated by its Repository key so gathered unions need no remapping.
 
 **Fix**:
 A commit that modifies lines belonging to existing commits (of a Feature or of another Fix) without adding a Feature.
 _Avoid_: bugfix, patch
 
 **Fix lineage**:
-The chain formed by fixes of fixes. A Fix is attributed to every unit in its lineage: the Fix it targets and, transitively, the original Feature. Metrics count each unit once per lineage to avoid double-counting.
+The relation formed by fixes that target other fixes. A Fix is attributed to every Feature its chain reaches: the Fixes it targets and, transitively, the original Feature(s) — a fix may target several units and so reach several features. Metrics count each Fix once per Feature it reaches.
 
 **Feature attribution**:
 The mapping of a commit onto a Feature: directly (the commit defines the feature) or via blame (the commit touches the feature's lines).
@@ -53,6 +55,27 @@ A user message after a Skill invocation that redirects the agent, as opposed to 
 
 **Historical invocation**:
 A Skill invocation from sessions predating the plugin's existence. Most skill attributes cannot be measured for these; Skill-invocation stats cover new Invocations only.
+
+**Target repo**:
+The git working copy a Run analyzes. One checkout pairs one Repository key.
+
+**Artifact**:
+The committed `.skill-stats/` store holding a Target repo's complete git-analysis state (verdicts, features, fix attribution, lineage). Source of truth for that repo's numbers; Org-wide metrics are gathered from many Artifacts.
+_Avoid_: export, dump
+
+**Artifact digest**:
+A value stored inside the Artifact covering its whole content except the digest itself. Verification anchor for Updates and gathers: neither builds on an Artifact whose digest fails to verify.
+
+**Coverage horizon**:
+The commit up to which an Artifact version's data is trusted. Stored inside the Artifact; Partial recompute resumes after it.
+_Avoid_: watermark, boundary
+
+**Sample**:
+One commit at which the live-lines history is recorded for every feature alive at that point. The curve is Samples joined; the latest Sample pins the per-feature summaries.
+_Avoid_: checkpoint, snapshot
+
+**Partial recompute**:
+What an Artifact digest failure triggers: trust is rebuilt from the newest prior artifact version that still verifies, and work newer than it is re-analyzed. Falls back to a full recompute when no verifiable version survives.
 
 **Target branch**:
 The single branch a git analysis run walks (main or an explicitly configured alternative). All metrics are computed on Target-branch commits only.
