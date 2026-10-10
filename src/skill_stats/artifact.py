@@ -41,7 +41,7 @@ from . import htmlreport
 FORMAT = 1
 
 DIGEST_BLANK = "-- digest:"
-_DIGEST_LINE_RE = re.compile(r"^-- digest:(?: ([0-9a-f]+))?$", re.M)
+_DIGEST_LINE_RE = re.compile(rb"^-- digest:(?: ([0-9a-f]+))?$", re.M)
 
 _SETTINGS_WHITELIST = ("branch", "min_target_lines", "model", "unattributed_lines")
 
@@ -240,6 +240,24 @@ def _lit(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+# printable ASCII minus the escape char: header values made only of these stay
+# literal; every other byte is escaped as \xNN (the escape char itself too, so
+# the representation is injective)
+_HDR_SAFE = set(range(0x20, 0x7F)) - {ord("\\")}
+
+
+def _hdr(value: object) -> str:
+    """Guaranteed single-line ASCII-safe header representation. A value can
+    never break out of its ``-- ...`` comment line: newlines, control bytes and
+    non-ASCII become \\xNN escapes (SQL/dot-command injection via a crafted
+    repository key is structurally impossible); values needing no escaping
+    stay literal for readability."""
+    out = []
+    for b in str(value).encode("utf-8"):
+        out.append(chr(b) if b in _HDR_SAFE else f"\\x{b:02X}")
+    return "".join(out)
+
+
 def _head(conn: sqlite3.Connection) -> str:
     covered = conn.execute("SELECT sha FROM commits ORDER BY walk_index DESC LIMIT 1").fetchone()
     key = conn.execute("SELECT repo_key FROM repositories ORDER BY id LIMIT 1").fetchone()
@@ -251,9 +269,9 @@ def _head(conn: sqlite3.Connection) -> str:
     return (
         "-- skill-stats artifact\n"
         f"-- format: {FORMAT}\n"
-        f"-- schema-step: {step_n}\n"
-        f"-- repository-key: {key['repo_key'] if key else ''}\n"
-        f"-- covered-through: {covered['sha'] if covered else ''}\n"
+        f"-- schema-step: {_hdr(step_n)}\n"
+        f"-- repository-key: {_hdr(key['repo_key'] if key else '')}\n"
+        f"-- covered-through: {_hdr(covered['sha'] if covered else '')}\n"
         f"{DIGEST_BLANK}\n"
     )
 
@@ -290,29 +308,39 @@ def write(conn: sqlite3.Connection, repo_dir: Path, with_report: bool = True) ->
 
 
 def digest_of(path: Path) -> str:
-    """The stored Artifact digest's meaning: sha256 over the content with the
-    digest line's value blanked. Raises when the file carries no digest."""
-    content = path.read_text(encoding="utf-8")
-    m = _DIGEST_LINE_RE.search(content)
-    if m is None or not m.group(1):
+    """The stored Artifact digest's meaning: sha256 over the exact file bytes
+    with the digest line's value blanked. Raises when the file carries no
+    digest. Bytes-based: no decoding happens anywhere in the path."""
+    parts = _digest_parts(Path(path).read_bytes())
+    if parts is None:
         raise ValueError(f"{path}: no digest line")
-    return hashlib.sha256(_blank(content, m).encode("utf-8")).hexdigest()
+    return hashlib.sha256(parts[0]).hexdigest()
 
 
 def verify(path: Path) -> str | None:
-    """None when the stored digest covers the file's content; else the error."""
+    """None when the stored digest covers the file's exact bytes; else the
+    error. Works on raw bytes — CRLF or invalid-UTF-8 tampering can never
+    launder through text-mode normalization, and malformed content yields a
+    failure verdict instead of an exception."""
     try:
-        content = path.read_text(encoding="utf-8")
+        data = Path(path).read_bytes()
     except OSError as exc:
         return str(exc)
-    m = _DIGEST_LINE_RE.search(content)
-    if m is None or not m.group(1):
+    parts = _digest_parts(data)
+    if parts is None:
         return "no digest line"
-    recomputed = hashlib.sha256(_blank(content, m).encode("utf-8")).hexdigest()
-    if recomputed != m.group(1):
-        return f"digest mismatch: stored {m.group(1)}, recomputed {recomputed}"
+    blanked, stored = parts
+    recomputed = hashlib.sha256(blanked).hexdigest()
+    if recomputed != stored.decode("ascii"):
+        return f"digest mismatch: stored {stored.decode('ascii')}, recomputed {recomputed}"
     return None
 
 
-def _blank(content: str, match: re.Match[str]) -> str:
-    return content[: match.start()] + DIGEST_BLANK + content[match.end() :]
+def _digest_parts(data: bytes) -> tuple[bytes, bytes] | None:
+    """(content with the digest value blanked, stored digest bytes) from raw
+    bytes; None when the digest line is missing or malformed."""
+    m = _DIGEST_LINE_RE.search(data)  # first occurrence: the header, always first
+    if m is None or not m.group(1):
+        return None
+    blanked = data[: m.start()] + DIGEST_BLANK.encode("ascii") + data[m.end() :]
+    return blanked, m.group(1)

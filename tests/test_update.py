@@ -123,3 +123,22 @@ def test_update_logs_digest_verdict_of_existing_artifact(tmp_path, repo, capsys,
     assert re.search(r"artifact digest: MISMATCH", out)
     # the rewrite supersedes the tampered file and verifies again
     assert artifact.verify(art_path) is None
+
+
+def test_update_supersedes_non_utf8_corrupted_artifact(tmp_path, repo, capsys, monkeypatch):
+    _two_commits(repo)
+    db_path = _init(tmp_path, repo)
+    monkeypatch.setattr(
+        "skill_stats.cli.Session",
+        lambda model, sid=None: FakeSession(['{"k":"cleanup","why":"w"}'] * 2),
+    )
+    main(["update", "--db", db_path])
+    capsys.readouterr()
+    art_path = repo / ".skill-stats" / "skill-stats.sql"
+    art_path.write_bytes(art_path.read_bytes() + b"\xff\xfe garbage")  # invalid UTF-8
+
+    main(["update", "--db", db_path])  # must continue, not abort
+    out = capsys.readouterr().out
+    assert "artifact digest: MISMATCH" in out
+    assert "artifact updated" in out
+    assert artifact.verify(art_path) is None

@@ -182,3 +182,64 @@ def test_header_fields(tmp_path, repo):
     blanked = re.sub(r"^-- digest: .*$", "-- digest:", content, count=1, flags=re.M)
     assert hashlib.sha256(blanked.encode("utf-8")).hexdigest() == digest
     conn.close()
+
+
+# ------------------------------------------- header injection + byte digest --
+
+
+def test_header_values_are_injection_safe(tmp_path, repo):
+    conn, *_ = _built_db(tmp_path, repo)
+    evil = "x\nCREATE TABLE pwned(x);\n\x07\"quoted\"'\\'"
+    conn.execute("UPDATE repositories SET repo_key = ?", (evil,))
+    conn.commit()
+    path = artifact.write(conn, repo, with_report=False)
+    content = path.read_bytes()
+
+    # header values stay inside their single comment line: nothing executable
+    key_lines = [ln for ln in content.splitlines() if ln.startswith(b"-- repository-key:")]
+    assert len(key_lines) == 1
+    assert b"\\x0A" in key_lines[0] and b"\\x07" in key_lines[0]  # newline/bell escaped
+    assert b"\\x5C" in key_lines[0]  # the escape char itself is escaped (injective)
+    # the dump replays standalone and no injected table appears
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.executescript(content.decode("utf-8"))
+    names = {r[0] for r in mat.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "pwned" not in names
+    mat.close()
+    assert artifact.verify(path) is None
+
+
+def test_header_dot_command_probe_is_byte_safe(tmp_path, repo):
+    conn, *_ = _built_db(tmp_path, repo)
+    conn.execute("UPDATE repositories SET repo_key = ?", ("-- .shell echo pwned",))
+    conn.commit()
+    path = artifact.write(conn, repo, with_report=False)
+    content = path.read_bytes()
+    # encodes nothing -> stays literal for readability, but no line ever
+    # starts with '.' (sqlite3 dot-command) or leaves the comment
+    assert b"-- repository-key: -- .shell echo pwned" in content
+    assert all(not ln.startswith(b".") for ln in content.splitlines())
+    mat = sqlite3.connect(tmp_path / "mat.db")
+    mat.executescript(content.decode("utf-8"))
+    mat.close()
+    assert artifact.verify(path) is None
+
+
+def test_verify_is_byte_exact(tmp_path, repo):
+    conn, *_ = _built_db(tmp_path, repo)
+    path = artifact.write(conn, repo, with_report=False)
+    data = path.read_bytes()
+
+    crlf = tmp_path / "crlf.sql"
+    crlf.write_bytes(data.replace(b"\n", b"\r\n"))
+    assert artifact.verify(crlf) is not None  # CRLF must not launder through text mode
+
+    bad = tmp_path / "bad.sql"
+    bad.write_bytes(data + b"\xff\xfe")
+    err = artifact.verify(bad)
+    assert err is not None and "mismatch" in err  # failure verdict, no decode crash
+
+    # digest_of hashes exact bytes and is stable over odd content
+    first = artifact.digest_of(bad)
+    assert first == artifact.digest_of(bad)
+    assert b"\r" not in data  # serialize writes LF-only bytes, stable to hash
