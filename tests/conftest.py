@@ -16,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
+from skill_stats.classify import create_feature
 from skill_stats.db import connect
+from skill_stats.identity import register_repository
 
 
 def run(repo: Path, *args: str) -> None:
@@ -32,8 +34,23 @@ def commit_files(repo: Path, msg: str, files: dict[str, str]) -> str:
     run(repo, "commit", "-m", msg)
     return subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
+
+
+def make_db(path: Path, repo: Path, branch: str = "main"):
+    """A fresh DB with THE repository row registered (wave 1: one repo per DB)."""
+    conn = connect(path)
+    register_repository(conn, repo, branch)
+    return conn
+
+
+def add_feature(conn, title: str, about: str = "", created_at: str = "2026-01-01T00:00:00Z") -> str:
+    """Insert a feature with the repo-prefixed id for the DB's single repo."""
+    repo_id = conn.execute("SELECT id FROM repositories ORDER BY id").fetchone()[0]
+    return create_feature(conn, repo_id, title, about, created_at)
 
 
 @pytest.fixture()
@@ -50,38 +67,70 @@ def repo(tmp_path: Path) -> Path:
 @pytest.fixture()
 def shas(repo: Path) -> dict[str, str]:
     history: dict[str, str] = {}
-    history["c1"] = commit_files(repo, "feature one: alpha module", {
-        "a.txt": "alpha\nbeta\ncharlie\n",
-    })
-    history["c2"] = commit_files(repo, "feature two: beta index", {
-        "b.txt": "one\ntwo\n",
-    })
-    history["c3"] = commit_files(repo, "fix alpha handling", {
-        "a.txt": "ALPHA\nbeta\ncharlie\n",
-    })
-    history["c4"] = commit_files(repo, "refactor: reorder alpha module", {
-        "a.txt": "charlie\nALPHA\nbeta\n",
-    })
-    history["c5"] = commit_files(repo, "fix: actually repair alpha v2", {
-        "a.txt": "charlie\nALPHAV2\nbeta\n",
-    })
+    history["c1"] = commit_files(
+        repo,
+        "feature one: alpha module",
+        {
+            "a.txt": "alpha\nbeta\ncharlie\n",
+        },
+    )
+    history["c2"] = commit_files(
+        repo,
+        "feature two: beta index",
+        {
+            "b.txt": "one\ntwo\n",
+        },
+    )
+    history["c3"] = commit_files(
+        repo,
+        "fix alpha handling",
+        {
+            "a.txt": "ALPHA\nbeta\ncharlie\n",
+        },
+    )
+    history["c4"] = commit_files(
+        repo,
+        "refactor: reorder alpha module",
+        {
+            "a.txt": "charlie\nALPHA\nbeta\n",
+        },
+    )
+    history["c5"] = commit_files(
+        repo,
+        "fix: actually repair alpha v2",
+        {
+            "a.txt": "charlie\nALPHAV2\nbeta\n",
+        },
+    )
     # patch-id duplicate setup: introduce dup.txt, remove it, re-add the same content
-    history["c6"] = commit_files(repo, "add dup suport", {
-        "dup.txt": "dup\nextra\n",
-    })
+    history["c6"] = commit_files(
+        repo,
+        "add dup suport",
+        {
+            "dup.txt": "dup\nextra\n",
+        },
+    )
     (repo / "dup.txt").unlink()
     run(repo, "add", "-A")
     run(repo, "commit", "-m", "remove dup file")
     history["cr"] = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    history["c7"] = commit_files(repo, "add dup support", {
-        "dup.txt": "dup\nextra\n",
-    })
+    history["c7"] = commit_files(
+        repo,
+        "add dup support",
+        {
+            "dup.txt": "dup\nextra\n",
+        },
+    )
     # whitespace-only change (adds a blank line): no deletions, no blame targets
-    history["c8"] = commit_files(repo, "tidy: blank line", {
-        "a.txt": "charlie\n\nALPHAV2\nbeta\n",
-    })
+    history["c8"] = commit_files(
+        repo,
+        "tidy: blank line",
+        {
+            "a.txt": "charlie\n\nALPHAV2\nbeta\n",
+        },
+    )
     return history
 
 

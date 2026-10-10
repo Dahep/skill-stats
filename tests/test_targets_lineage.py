@@ -1,9 +1,11 @@
 """Blame evidence + fix target reduction + lineage closure tests."""
 
+import subprocess
+
 import pytest
 
+from conftest import add_feature, commit_files, make_db, run
 from skill_stats.blame import blame_deleted_lines, contiguous, delete_ranges
-from skill_stats.db import connect
 from skill_stats.gitwalk import walk
 from skill_stats.lineage import close_lineage
 from skill_stats.targets import annotate_all, annotate_fix
@@ -11,7 +13,7 @@ from skill_stats.targets import annotate_all, annotate_fix
 
 @pytest.fixture()
 def db(repo, shas):
-    conn = connect(repo / "t.db")
+    conn = make_db(repo / "t.db", repo)
     walk(repo, conn, "main")
     return conn
 
@@ -55,7 +57,8 @@ def test_annotate_fix_then_annotate_all(repo, shas, db):
     touches = db.execute(
         "SELECT c.sha, t.hit_lines FROM fix_touches t"
         " JOIN commits c ON c.id = t.source_commit_id"
-        " JOIN commits f ON f.id = t.fix_commit_id WHERE f.sha = ?", (shas["c3"],)
+        " JOIN commits f ON f.id = t.fix_commit_id WHERE f.sha = ?",
+        (shas["c3"],),
     ).fetchall()
     assert [(r["sha"], r["hit_lines"]) for r in touches] == [(shas["c1"], 1)]
 
@@ -95,11 +98,7 @@ def _verdict_fix(db, sha):
 def test_lineage_transitive_and_via(repo, shas, db):
     _verdict_fix(db, shas["c3"])
     _verdict_fix(db, shas["c5"])
-    db.execute(
-        "INSERT INTO features (title, about, created_at) VALUES ('alpha module', 'x',"
-        " '2026-01-01T00:00:00Z')"
-    )
-    feat_a = db.execute("SELECT id FROM features WHERE title = 'alpha module'").fetchone()[0]
+    feat_a = add_feature(db, "alpha module", "x", "2026-01-01T00:00:00Z")
     db.execute(
         "INSERT INTO commits_features (commit_id, feature_id, role)"
         " VALUES ((SELECT id FROM commits WHERE sha = ?), ?, 'defines')",
@@ -126,8 +125,7 @@ def test_lineage_transitive_and_via(repo, shas, db):
 def test_lineage_idempotent(repo, shas, db):
     _verdict_fix(db, shas["c3"])
     _verdict_fix(db, shas["c5"])
-    db.execute("INSERT INTO features (title, about, created_at) VALUES ('alpha', 'x', '2026')")
-    feat_a = db.execute("SELECT id FROM features WHERE title = 'alpha'").fetchone()[0]
+    feat_a = add_feature(db, "alpha", "x", "2026")
     db.execute(
         "INSERT INTO commits_features (commit_id, feature_id, role)"
         " VALUES ((SELECT id FROM commits WHERE sha = ?), ?, 'defines')",
@@ -143,9 +141,24 @@ def test_lineage_idempotent(repo, shas, db):
 
 def test_lineage_requires_defines(tmp_path, repo, shas):
     # no features defined at all -> no closure rows
-    conn = connect(repo / "x.db")
+    conn = make_db(repo / "x.db", repo)
     walk(repo, conn, "main")
     _verdict_fix(conn, shas["c3"])
     conn.commit()
     annotate_all(repo, conn)
     assert close_lineage(conn) == 0
+
+
+def test_blame_ignores_store_paths(repo):
+    c1 = commit_files(repo, "content", {"n.txt": "one\ntwo\n", ".skill-stats/a.sql": "old\n"})
+    (repo / "n.txt").write_text("ONE\ntwo\n")
+    (repo / ".skill-stats" / "a.sql").unlink()
+    run(repo, "add", "-A")
+    run(repo, "commit", "-m", "drop store, rewrite content")
+    c2 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    # the store-path deletion never contributes blame evidence
+    lines = blame_deleted_lines(repo, c2)
+    assert set(lines) == {"n.txt"}
+    assert lines["n.txt"] == [c1]

@@ -17,7 +17,10 @@ def connect(path: Path) -> sqlite3.Connection:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (tablename,)
         ).fetchone()
         if not applied:
-            conn.executescript(step)
+            if callable(step):
+                step(conn)
+            else:
+                conn.executescript(step)
             conn.execute(f"CREATE TABLE {tablename} (ok)")
             conn.commit()
     return conn

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import db, gitwalk
+from . import db, gitwalk, identity
 from .classify import DEFAULT_MODEL, SESSION_DIR, Session, classify_pending
 from .lineage import close_lineage
 from .targets import annotate_all
@@ -16,8 +16,7 @@ from .targets import annotate_all
 
 def _settings(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
-        r["key"]: json.loads(r["value"])
-        for r in conn.execute("SELECT key, value FROM settings")
+        r["key"]: json.loads(r["value"]) for r in conn.execute("SELECT key, value FROM settings")
     }
 
 
@@ -78,6 +77,7 @@ def main(argv: list[str] | None = None) -> None:
         db_path = new_db(args.db, args)
         conn = db.connect(db_path)
         branch = args.branch or gitwalk.current_branch(repo)
+        identity.register_repository(conn, repo, branch)  # writes repositories row + repo_id
         cfg = {
             "repo": str(repo),
             "branch": branch,
@@ -114,9 +114,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"classified {len(done)} commits (session {session.session_id})")
     elif args.cmd == "detect":
         assert repo_dir is not None, "run init first"
-        n_fixes = annotate_all(
-            repo_dir, conn, int(settings.get("min_target_lines", 1))
-        )
+        n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))
         print(f"annotated {n_fixes} fix commits")
     elif args.cmd == "lineage":
         n_rows = close_lineage(conn)

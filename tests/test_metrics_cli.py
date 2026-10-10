@@ -4,32 +4,37 @@ import json
 
 import pytest
 
+from conftest import add_feature, make_db
 from skill_stats.cli import main
-from skill_stats.db import connect
 from skill_stats.gitwalk import walk
 from skill_stats.metrics import snapshot, snapshot_to_json
 
 
 @pytest.fixture()
 def classified(tmp_path, repo, shas):
-    conn = connect(tmp_path / "m.db")
+    conn = make_db(tmp_path / "m.db", repo)
     walk(repo, conn, "main")
     for key, verdict in (
-        ("c1", "feature"), ("c2", "feature"), ("c3", "fix"), ("c4", "refactor"),
-        ("c5", "fix"), ("c6", "feature"), ("cr", "feature"), ("c7", "feature"), ("c8", "cleanup"),
+        ("c1", "feature"),
+        ("c2", "feature"),
+        ("c3", "fix"),
+        ("c4", "refactor"),
+        ("c5", "fix"),
+        ("c6", "feature"),
+        ("cr", "feature"),
+        ("c7", "feature"),
+        ("c8", "cleanup"),
     ):
         conn.execute(
             "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model,"
             " classified_at) VALUES ((SELECT id FROM commits WHERE sha = ?), ?, '', '', 'm','x')",
             (shas[key], verdict),
         )
-    conn.execute(
-        "INSERT INTO features (title, about, created_at) VALUES ('alpha', 'x', '2026-01-01')"
-    )
-    fid = conn.execute("SELECT id FROM features").fetchone()[0]
+    fid = add_feature(conn, "alpha", "x", "2026-01-01")
     conn.execute(
         "INSERT INTO commits_features (commit_id, feature_id, role)"
-        " VALUES ((SELECT id FROM commits WHERE sha = ?), ?, 'defines')", (shas["c1"], fid)
+        " VALUES ((SELECT id FROM commits WHERE sha = ?), ?, 'defines')",
+        (shas["c1"], fid),
     )
     conn.commit()
     yield conn
@@ -71,8 +76,16 @@ def test_cli_init_walk(tmp_path, repo, shas, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "walked 9 new commits" in out
     import sqlite3
+
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     assert conn.execute("SELECT COUNT(*) FROM commits").fetchone()[0] == 9
+    # init registered THE repository row and stored its id in settings
+    row = conn.execute("SELECT * FROM repositories").fetchone()
+    assert row["repo_key"] == "local:repo@main"
+    rid = conn.execute("SELECT value FROM settings WHERE key = 'repo_id'").fetchone()[0]
+    assert json.loads(rid) == row["id"]
+    assert conn.execute("SELECT COUNT(DISTINCT repo_id) FROM commits").fetchone()[0] == 1
 
 
 def test_cli_report_text(classified, capsys):
@@ -128,4 +141,4 @@ def test_html_report(tmp_path, classified, repo):
     assert "<svg" in text and "skill-stats report" in text
     assert "alpha" in text  # fixture feature named in ranking table
     ranking = feature_ranking(classified)[:5]
-    assert ranking and ranking[0].fid == 1 and ranking[0].fixes == 2
+    assert ranking and ranking[0].fid == "repo-1" and ranking[0].fixes == 2
