@@ -161,6 +161,16 @@ def main(argv: list[str] | None = None) -> None:
     conn.close()
 
 
+def _pending_count(conn: sqlite3.Connection) -> int:
+    """Commits without a verdict row — the classification backlog."""
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) c FROM commits c LEFT JOIN commit_verdicts v"
+            " ON v.commit_id = c.id WHERE v.commit_id IS NULL"
+        ).fetchone()["c"]
+    )
+
+
 def _run_update(
     conn: sqlite3.Connection, repo_dir: Path, settings: dict[str, Any], args: argparse.Namespace
 ) -> None:
@@ -189,6 +199,7 @@ def _run_update(
     print(f"walked {n} new commits")
 
     if not args.no_classify:
+        pending_before = _pending_count(conn)
         try:
             SESSION_DIR.mkdir(parents=True, exist_ok=True)
             sid = settings.get("classify_session_id") or None
@@ -201,8 +212,18 @@ def _run_update(
                 if session.session_id:
                     _set(conn, "classify_session_id", session.session_id)
             print(f"classified {len(done)} commits")
-        except (OSError, RuntimeError) as exc:
-            print(f"WARNING: classification unavailable ({exc}); backlog stays pending")
+        except (OSError, RuntimeError, ValueError) as exc:
+            # ValueError covers bad model replies reaching apply_reply (cited
+            # unknown feature ids; JSONDecodeError is one). classify_pending
+            # aborts mid-loop: what landed stays counted, the raising commit
+            # and the rest wait for a later update (Q13), and nothing below is
+            # blocked. The `classify` plumbing verb keeps raising.
+            processed = pending_before - _pending_count(conn)
+            print(
+                f"WARNING: classification unavailable ({exc}); {processed} classified"
+                " before the abort, the rest stay pending and reprocess on a later"
+                " update"
+            )
 
     if not args.no_detect:
         n_fixes = annotate_all(repo_dir, conn, int(settings.get("min_target_lines", 1)))

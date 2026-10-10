@@ -142,3 +142,32 @@ def test_update_supersedes_non_utf8_corrupted_artifact(tmp_path, repo, capsys, m
     assert "artifact digest: MISMATCH" in out
     assert "artifact updated" in out
     assert artifact.verify(art_path) is None
+
+
+def test_update_classifier_value_error_keeps_pipeline_and_backlog(
+    tmp_path, repo, capsys, monkeypatch
+):
+    _two_commits(repo)
+    db_path = _init(tmp_path, repo)
+    # well-formed replies: one lands, one cites an unknown feature id -> ValueError
+    replies = [
+        '{"k":"new","title":"one","about":"x","why":"y"}',
+        '{"k":"existing","f":"nope-999","why":"x"}',
+    ]
+    monkeypatch.setattr("skill_stats.cli.Session", lambda model, sid=None: FakeSession(replies))
+    main(["update", "--db", db_path])  # must not abort detect/lineage/live-lines/serialize
+    out = capsys.readouterr().out
+    assert "WARNING: classification unavailable" in out
+    assert "1 classified before the abort" in out  # processed-so-far surfaced honestly
+    assert "2 walked, 1 classified, 1 pending, artifact updated" in out
+    assert artifact.verify(repo / ".skill-stats" / "skill-stats.sql") is None
+
+    # a retry keeps the raising commit pending and still exits 0
+    monkeypatch.setattr(
+        "skill_stats.cli.Session",
+        lambda model, sid=None: FakeSession(['{"k":"existing","f":"nope-999","why":"x"}']),
+    )
+    main(["update", "--db", db_path])
+    out2 = capsys.readouterr().out
+    assert "2 walked, 1 classified, 1 pending, artifact updated" in out2
+    assert "WARNING: 1 commits unclassified" in out2
