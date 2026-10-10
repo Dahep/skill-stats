@@ -46,6 +46,10 @@ replies are stored as verdict `unknown` and excluded from metrics.
 
 ## Not built yet (per DESIGN.md)
 
+- Artifact store (ADR-0003: committed `.skill-stats/` SQL snapshot + digest +
+  HTML report), `update` verb, exclusion filter, live-lines backfill, CI
+  scaffold, schema step 1 (repo-scoped ids).
+- Gather / union DB org-wide reports.
 - opencode-history import (schema is settled, built later).
 - Plugin-logged skill metrics (ADR-0002: going-forward only).
 
