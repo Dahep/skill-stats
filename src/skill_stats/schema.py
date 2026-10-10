@@ -359,7 +359,29 @@ def _rebuild_feature_links(conn: sqlite3.Connection, slug: str) -> None:
     conn.execute("CREATE INDEX idx_fixes_features_feature ON fixes_features(feature_id)")
 
 
+def _step_2(conn: sqlite3.Connection) -> None:
+    """Feature size (live lines) + Sample rows (grill-r3-Q7/Q9).
+
+    features.live_lines: the feature's line count at the Target-branch tip as
+    of the last live-lines run (NOT NULL DEFAULT 0 — the value is only ever a
+    measurement, never unknown); feature_line_samples carries the history:
+    one row per (feature, sample commit) for every feature alive at that
+    commit — the same row family for forward samples (each update, at the
+    tip) and for backfill sweeps (grill-r3-Q9). No timestamps anywhere: the
+    at_commit_sha key is the Sample identity (CONTEXT.md "Sample")."""
+    conn.execute("ALTER TABLE features ADD COLUMN live_lines INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """CREATE TABLE feature_line_samples (
+               feature_id TEXT NOT NULL REFERENCES features(id),
+               at_commit_sha TEXT NOT NULL,
+               live_lines INTEGER NOT NULL,
+               PRIMARY KEY (feature_id, at_commit_sha)
+           )"""
+    )
+
+
 SCHEMA_STEPS: list[Step] = [
     STEP_0_SQL,  # 0: initial schema
     _step_1,  # 1: repository identity, repo-scoped commits, prefixed feature ids
+    _step_2,  # 2: features.live_lines + feature_line_samples (Sample rows)
 ]
