@@ -135,9 +135,14 @@ def _step_1(conn: sqlite3.Connection) -> None:
     repo-prefixed TEXT id, add repo_id), commits_features/fixes_features (their
     feature_id columns follow the new TEXT feature ids). Attribution tables
     keep referencing commits.id INTEGER; composite (repo, sha) references are
-    the wave-2 union/serializability path. Old stored diffs are run through the
-    same store-path exclusion and churn derivation the walk uses, so migrated
-    rows match freshly walked ones.
+    the wave-2 union/serializability path.
+
+    Store-only commits (stripped diff empty) are PURGED with every dependent
+    row and their orphaned features — the spec says they never enter stats, so
+    migrated DBs must agree with freshly walked ones. Old stored diffs are run
+    through the same store-path exclusion and churn derivation the walk uses.
+    Atomicity is owned by db._apply_migration: this function is pure DDL/DML
+    inside its transaction (no pragmas, no commits of its own).
     """
     repo_value = _setting(conn, "repo")
     branch_value = _setting(conn, "branch")
@@ -155,45 +160,80 @@ def _step_1(conn: sqlite3.Connection) -> None:
         base, slug = identity.local_identity(repo_value)
         key = identity.repo_key(base, branch_value if isinstance(branch_value, str) else None)
 
-    conn.commit()
-    conn.execute("PRAGMA foreign_keys = OFF")
-    try:
-        with conn:
-            conn.execute(
-                """CREATE TABLE repositories (
-                       id INTEGER PRIMARY KEY,
-                       repo_key TEXT NOT NULL UNIQUE,
-                       slug TEXT NOT NULL,
-                       branch TEXT,
-                       clone_url TEXT,
-                       added_at TEXT
-                   )"""
-            )
-            repo_id: int | None = None
-            if key is not None:
-                cur = conn.execute(
-                    "INSERT INTO repositories (repo_key, slug, branch, clone_url, added_at)"
-                    " VALUES (?, ?, ?, NULL, datetime('now'))",
-                    (key, slug, branch_value),
-                )
-                assert cur.lastrowid is not None
-                repo_id = int(cur.lastrowid)
-                conn.execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('repo_id', ?)",
-                    (json.dumps(repo_id),),
-                )
-            _rebuild_commits(conn, repo_id)
-            _rebuild_features(conn, repo_id, slug or "")
-            _rebuild_feature_links(conn, slug or "")
-            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
-                raise RuntimeError(f"migration step 1 left FK violations: {violations[:5]}")
-    finally:
-        conn.commit()
-        conn.execute("PRAGMA foreign_keys = ON")
+    stats: dict[int, gitwalk.DiffStat] = {}
+    stale: set[int] = set()
+    for r in conn.execute("SELECT id, diff FROM commits ORDER BY id"):
+        stat = gitwalk.prepare_diff(r["diff"])
+        stats[int(r["id"])] = stat
+        if not stat.diff.strip():
+            stale.add(int(r["id"]))
+    _purge_stale(conn, stale)
+
+    conn.execute(
+        """CREATE TABLE repositories (
+               id INTEGER PRIMARY KEY,
+               repo_key TEXT NOT NULL UNIQUE,
+               slug TEXT NOT NULL,
+               branch TEXT,
+               clone_url TEXT,
+               added_at TEXT
+           )"""
+    )
+    repo_id: int | None = None
+    if key is not None:
+        cur = conn.execute(
+            "INSERT INTO repositories (repo_key, slug, branch, clone_url, added_at)"
+            " VALUES (?, ?, ?, NULL, datetime('now'))",
+            (key, slug, branch_value),
+        )
+        assert cur.lastrowid is not None
+        repo_id = int(cur.lastrowid)
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('repo_id', ?)",
+            (json.dumps(repo_id),),
+        )
+    _rebuild_commits(conn, repo_id, stats)
+    _rebuild_features(conn, repo_id, slug or "")
+    _rebuild_feature_links(conn, slug or "")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"migration step 1 left FK violations: {violations[:5]}")
 
 
-def _rebuild_commits(conn: sqlite3.Connection, repo_id: int | None) -> None:
+def _purge_stale(conn: sqlite3.Connection, stale: set[int]) -> None:
+    """Drop store-only commits' dependent rows and features left without any
+    defining/touching commit (they would only pollute stats). The commit rows
+    themselves are skipped by _rebuild_commits."""
+    if stale:
+        marks = ",".join("?" * len(stale))
+        ids: tuple[int, ...] = tuple(sorted(stale))
+        conn.execute(f"DELETE FROM commit_verdicts WHERE commit_id IN ({marks})", ids)
+        conn.execute(f"DELETE FROM commits_features WHERE commit_id IN ({marks})", ids)
+        conn.execute(
+            f"DELETE FROM fix_touches WHERE fix_commit_id IN ({marks})"
+            f" OR source_commit_id IN ({marks})",
+            ids + ids,
+        )
+        conn.execute(
+            f"DELETE FROM fix_targets WHERE fix_commit_id IN ({marks})"
+            f" OR target_commit_id IN ({marks})",
+            ids + ids,
+        )
+        conn.execute(
+            f"DELETE FROM fixes_features WHERE fix_commit_id IN ({marks})"
+            f" OR via_fix_commit_id IN ({marks})",
+            ids + ids,
+        )
+    conn.execute(
+        "DELETE FROM fixes_features WHERE feature_id NOT IN"
+        " (SELECT feature_id FROM commits_features)"
+    )
+    conn.execute("DELETE FROM features WHERE id NOT IN (SELECT feature_id FROM commits_features)")
+
+
+def _rebuild_commits(
+    conn: sqlite3.Connection, repo_id: int | None, stats: dict[int, gitwalk.DiffStat]
+) -> None:
     conn.execute(
         """CREATE TABLE commits_migration (
                id INTEGER PRIMARY KEY,
@@ -216,9 +256,10 @@ def _rebuild_commits(conn: sqlite3.Connection, repo_id: int | None) -> None:
                UNIQUE (repo_id, walk_index)
            )"""
     )
-    rows = conn.execute("SELECT * FROM commits ORDER BY id").fetchall()
-    for r in rows:
-        stat = gitwalk.prepare_diff(r["diff"])  # same exclusion + churn rules as walk
+    for r in conn.execute("SELECT * FROM commits ORDER BY id"):
+        stat = stats[int(r["id"])]  # same exclusion + churn rules as walk
+        if not stat.diff.strip():
+            continue  # store-only commit: purged from stats entirely
         conn.execute(
             """INSERT INTO commits_migration
                (id, repo_id, sha, parent_sha, tree_sha, committed_at, author_name, title,

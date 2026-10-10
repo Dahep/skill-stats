@@ -11,7 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .gitwalk import _git, is_store_path
+from .gitwalk import _git, is_store_path, parse_diff_header
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.M)
 
@@ -31,13 +31,14 @@ def changed_hunks(repo: Path, sha: str) -> dict[str, list[Hunk]]:
     current: str | None = None
     for line in out.splitlines():
         if line.startswith("diff --git "):
-            m: re.Match[str] | None
-            if m := re.match(r"diff --git a/(.*?) b/.*$", line):
-                current = m.group(1)
-                if is_store_path(current):
-                    current = None  # store paths never contribute blame evidence
-                if current is not None:
-                    per_file.setdefault(current, [])
+            paths = parse_diff_header(line)
+            if paths is None or is_store_path(paths[0]) or is_store_path(paths[1]):
+                # store paths (either side: renames into/out of the store
+                # included) never contribute blame evidence (ADR-0003 cl. 4)
+                current = None
+            else:
+                current = paths[0]
+                per_file.setdefault(current, [])
         elif current is not None:
             per_file[current].append(line)
     result: dict[str, list[Hunk]] = {}

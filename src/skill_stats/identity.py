@@ -9,6 +9,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import warnings
 from pathlib import Path
 
 _SCP_RE = re.compile(r"^(?:[^@/:]+@)?([^/:]+):(.+)$")
@@ -82,6 +83,12 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
     URL (local: shim when unavailable) and store its id in settings.repo_id so
     subsequent commands reuse it.
 
+    Re-init safety: an existing row is never silently relabeled. Same key is an
+    idempotent no-op; a key change against a DB with data refuses (or upgrades
+    a shim to its canonical URL — the documented migration flow) and a
+    canonical key is never downgraded to the local: shim because origin
+    resolution failed on this run.
+
     Wave 1: a DB manages exactly one repository (the row the DB was init'd
     against); a second row is refused rather than silently half-supported."""
     url = origin_url(repo)
@@ -91,17 +98,15 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
     else:
         base, slug, clone_url = *local_identity(str(repo)), None
     key = repo_key(base, branch)
-    existing = conn.execute("SELECT id FROM repositories ORDER BY id").fetchall()
+    existing = conn.execute("SELECT id, repo_key FROM repositories ORDER BY id").fetchall()
     if len(existing) > 1:
         raise RuntimeError("wave 1 manages a single repository row per DB")
     with conn:
         if existing:
-            rid = int(existing[0]["id"])
-            conn.execute(
-                "UPDATE repositories SET repo_key = ?, slug = ?, branch = ?, clone_url = ?"
-                " WHERE id = ?",
-                (key, slug, branch, clone_url, rid),
-            )
+            row = existing[0]
+            rid = int(row["id"])
+            if key != row["repo_key"]:
+                rid = _relabel(conn, rid, str(row["repo_key"]), key, slug, branch, clone_url)
         else:
             cur = conn.execute(
                 "INSERT INTO repositories (repo_key, slug, branch, clone_url, added_at)"
@@ -114,6 +119,40 @@ def register_repository(conn: sqlite3.Connection, repo: Path, branch: str | None
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('repo_id', ?)",
             (json.dumps(rid),),
         )
+    return rid
+
+
+def _relabel(
+    conn: sqlite3.Connection,
+    rid: int,
+    old_key: str,
+    key: str,
+    slug: str,
+    branch: str | None,
+    clone_url: str | None,
+) -> int:
+    """Apply a repository-key change to the single existing row, or refuse it."""
+    old_canonical = not old_key.startswith("local:")
+    if key.startswith("local:") and old_canonical:
+        warnings.warn(
+            f"keeping stored repository identity {old_key}: origin URL unavailable,"
+            f" not downgrading to the {key} shim",
+            UserWarning,
+            stacklevel=2,
+        )
+        return rid
+    has_data = bool(conn.execute("SELECT 1 FROM commits LIMIT 1").fetchone())
+    if has_data and (old_canonical or key.startswith("local:")):
+        raise RuntimeError(
+            f"refusing to relabel repository identity: the DB holds commits under"
+            f" {old_key} but init resolves {key}. Re-init against a different"
+            f" repository or branch is not supported; use a fresh DB instead."
+        )
+    warnings.warn(f"replacing repository identity {old_key} -> {key}", UserWarning, stacklevel=2)
+    conn.execute(
+        "UPDATE repositories SET repo_key = ?, slug = ?, branch = ?, clone_url = ? WHERE id = ?",
+        (key, slug, branch, clone_url, rid),
+    )
     return rid
 
 

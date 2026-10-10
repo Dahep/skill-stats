@@ -25,12 +25,84 @@ from . import identity
 
 STORE_DIR_NAME = ".skill-stats"
 
-_DIFF_HEADER_RE = re.compile(r"^diff --git a/(.*?) b/(.*)$")
+_DIFF_GIT_PREFIX = "diff --git "
+_QUOTED_TOKEN_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_SIMPLE_ESCAPES = {
+    "n": b"\n",
+    "t": b"\t",
+    "r": b"\r",
+    "a": b"\a",
+    "b": b"\b",
+    "f": b"\f",
+    "v": b"\v",
+    '"': b'"',
+    "\\": b"\\",
+}
 
 
 def is_store_path(path: str) -> bool:
     """True when any path component names the artifact store dir (any depth)."""
     return STORE_DIR_NAME in PurePosixPath(path).parts
+
+
+def _unquote_git_path(token: str) -> str:
+    """Decode one C-quoted git path token ('"a/x\\303\\244"') to a str path."""
+    body = token[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8", "surrogateescape"))
+            i += 1
+            continue
+        i += 1
+        if i >= len(body):
+            break
+        esc = body[i]
+        if esc in _SIMPLE_ESCAPES:
+            out.extend(_SIMPLE_ESCAPES[esc])
+            i += 1
+        elif esc.isdigit():
+            out.append(int(body[i : i + 3], 8))  # octal escapes carry raw bytes
+            i += 3
+        else:
+            out.extend(esc.encode("utf-8", "surrogateescape"))
+            i += 1
+    return out.decode("utf-8", "surrogateescape")
+
+
+def parse_diff_header(line: str) -> tuple[str, str] | None:
+    """(old path, new path) from a 'diff --git' header line, a/ b/ prefixes
+    stripped. Handles both spellings git emits: bare paths and C-quoted paths
+    (git quotes BOTH sides together when either contains non-ASCII, tabs,
+    quotes or backslashes). None when the line is not a parseable header."""
+    if not line.startswith(_DIFF_GIT_PREFIX):
+        return None
+    rest = line[len(_DIFF_GIT_PREFIX) :].rstrip("\r\n")
+    if rest.startswith('"'):
+        tokens: list[str] = []
+        pos = 0
+        for n in range(2):
+            m = _QUOTED_TOKEN_RE.match(rest, pos)
+            if m is None:
+                return None
+            tokens.append(_unquote_git_path(m.group(0)))
+            pos = m.end()
+            if n == 0:
+                if rest[pos : pos + 1] != " ":
+                    return None
+                pos += 1
+        if rest[pos:].strip():
+            return None
+    else:
+        # bare paths can contain spaces; git's own output splits them at " b/"
+        j = rest.find(" b/")
+        if j == -1:
+            return None
+        tokens = [rest[:j], rest[j + 1 :]]
+    stripped = [t[2:] if t[:2] in ("a/", "b/") else t for t in tokens]
+    return stripped[0], stripped[1]
 
 
 @dataclass(frozen=True)
@@ -47,14 +119,16 @@ def prepare_diff(diff: str) -> DiffStat:
     """One pass over a unified diff: drop sections touching store paths and
     count added/deleted lines (rules of the old metrics._diff_churn: lines
     starting +/- except the +++/--- headers). The single source of the churn
-    math; churn_per_feature reads the stored columns derived from it."""
+    math; churn_per_feature reads the stored columns derived from it. Every
+    'diff --git' line (quoted or bare) resets the section state."""
     out: list[str] = []
     added = deleted = 0
     keep = True  # lines before the first file header stay with the diff
     for line in diff.splitlines(keepends=True):
-        header = _DIFF_HEADER_RE.match(line.rstrip("\r\n"))
-        if header:
-            keep = not (is_store_path(header.group(1)) or is_store_path(header.group(2)))
+        if line.startswith(_DIFF_GIT_PREFIX):
+            paths = parse_diff_header(line)
+            # unparseable headers keep the section (never drop data silently)
+            keep = paths is None or not (is_store_path(paths[0]) or is_store_path(paths[1]))
         if not keep:
             continue
         out.append(line)

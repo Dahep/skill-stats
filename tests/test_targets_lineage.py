@@ -162,3 +162,41 @@ def test_blame_ignores_store_paths(repo):
     lines = blame_deleted_lines(repo, c2)
     assert set(lines) == {"n.txt"}
     assert lines["n.txt"] == [c1]
+
+
+def test_blame_rename_into_store_contributes_no_fix_attribution(repo, shas=None):
+    c1 = commit_files(repo, "content", {"lib.ts": "one\ntwo\nthree\n", "data.txt": "a\nb\n"})
+    # one commit: a modified rename of lib.ts INTO the store + a genuine fix
+    (repo / ".skill-stats").mkdir()
+    run(repo, "mv", "lib.ts", ".skill-stats/lib.ts")
+    (repo / ".skill-stats" / "lib.ts").write_text("one\nTWO\nthree\n")
+    (repo / "data.txt").write_text("a\n")  # genuine product fix: drop line b
+    run(repo, "add", "-A")
+    run(repo, "commit", "-m", "fix: drop b, park lib in store")
+    c2 = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # blame-level: the renamed (artifact-bound) hunks never appear
+    lines = blame_deleted_lines(repo, c2)
+    assert set(lines) == {"data.txt"}
+    assert lines["data.txt"] == [c1]
+
+    # attribution-level: exactly one fix touch, from the genuine fix only
+    conn = make_db(repo / "r.db", repo)
+    walk(repo, conn, "main")
+    conn.execute(
+        "INSERT INTO commit_verdicts (commit_id, verdict, rationale, raw_llm_output, model,"
+        " classified_at) VALUES ((SELECT id FROM commits WHERE sha = ?), 'fix', '', '', 'm',"
+        " '2026-01-01T00:00:00Z')",
+        (c2,),
+    )
+    conn.commit()
+    annotate_fix(repo, conn, c2, 1)
+    touches = conn.execute(
+        "SELECT t.hit_lines FROM fix_touches t"
+        " JOIN commits f ON f.id = t.fix_commit_id WHERE f.sha = ?",
+        (c2,),
+    ).fetchall()
+    assert [r["hit_lines"] for r in touches] == [1]
+    conn.close()

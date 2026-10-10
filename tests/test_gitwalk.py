@@ -220,3 +220,94 @@ def test_prepare_diff_strips_store_sections_any_depth():
     assert ".skill-stats-keep" in stat.diff and "+kept" in stat.diff
     # only -one/+ONE/+kept count
     assert (stat.added, stat.deleted, stat.churn) == (2, 1, 3)
+
+
+# --------------------------------------------- quoted diff headers (cl. 4) --
+# git quotes BOTH header paths (C-style, octal escapes for non-ASCII) when
+# either side needs it; exclusion must handle both spellings and reset state
+# at every section boundary regardless of section order.
+
+
+def test_parse_diff_header_bare_and_quoted():
+    from skill_stats.gitwalk import parse_diff_header
+
+    assert parse_diff_header("diff --git a/x.txt b/x.txt") == ("x.txt", "x.txt")
+    assert parse_diff_header('diff --git "a/n\\303\\244me.txt" "b/n\\303\\244me.txt"') == (
+        "näme.txt",
+        "näme.txt",
+    )
+    assert parse_diff_header('diff --git "a/t\\t x" "b/t\\t x"') == ("t\t x", "t\t x")
+    assert parse_diff_header('diff --git "a/.skill-stats/\\303\\244.sql" "b/.skill-stats/x"') == (
+        ".skill-stats/ä.sql",
+        ".skill-stats/x",
+    )
+    assert parse_diff_header("not a header") is None
+
+
+def test_quoted_store_section_after_normal_does_not_leak(repo):
+    c1 = commit_files(repo, "create", {"näme.txt": "one\ntwo\n", "n.txt": "one\ntwo\n"})
+    c2 = commit_files(
+        repo,
+        "mixed quoted",
+        {
+            "näme.txt": "one\nTWO\n",
+            "z/.skill-stats/ärger.sql": "INSERT\n",
+        },
+    )
+    db = make_db(repo / "w.db", repo)
+    assert walk(repo, db, "main") == 2
+    row = db.execute(
+        "SELECT diff, added_lines, deleted_lines, churn_lines FROM commits WHERE sha = ?", (c2,)
+    ).fetchone()
+    assert "+INSERT" not in row["diff"] and "rger.sql" not in row["diff"]
+    assert "TWO" in row["diff"]
+    assert row["diff"].count("diff --git") == 1  # only the normal section survives
+    assert (row["added_lines"], row["deleted_lines"], row["churn_lines"]) == (1, 1, 2)
+    assert c1  # fixture history shape
+
+
+def test_quoted_store_section_before_normal_does_not_swallow(repo):
+    commit_files(repo, "create", {"n.txt": "one\ntwo\n"})
+    c2 = commit_files(
+        repo,
+        "mixed quoted",
+        {
+            ".skill-stats/ärger.sql": "INSERT\n",
+            "n.txt": "one\nTWO\n",
+        },
+    )
+    db = make_db(repo / "w.db", repo)
+    assert walk(repo, db, "main") == 2
+    row = db.execute(
+        "SELECT diff, added_lines, deleted_lines, churn_lines FROM commits WHERE sha = ?", (c2,)
+    ).fetchone()
+    assert "+INSERT" not in row["diff"]
+    assert "TWO" in row["diff"]  # the later normal section is kept, not swallowed
+    assert (row["added_lines"], row["deleted_lines"], row["churn_lines"]) == (1, 1, 2)
+
+
+def test_prepare_diff_resets_state_at_every_header():
+    # handcrafted mixed order: bare normal, quoted store, bare normal
+    diff = (
+        "diff --git a/a.txt b/a.txt\n"
+        "--- a/a.txt\n"
+        "+++ b/a.txt\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        'diff --git "a/.skill-stats/\\303\\244.sql" "b/.skill-stats/\\303\\244.sql"\n'
+        '--- "a/.skill-stats/\\303\\244.sql"\n'
+        '+++ "b/.skill-stats/\\303\\244.sql"\n'
+        "@@ -0,0 +1 @@\n"
+        "+INSERT\n"
+        "diff --git a/b.txt b/b.txt\n"
+        "--- a/b.txt\n"
+        "+++ b/b.txt\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+    )
+    stat = prepare_diff(diff)
+    assert "+INSERT" not in stat.diff
+    assert "+new" in stat.diff and "+y" in stat.diff  # section after store survives
+    assert (stat.added, stat.deleted, stat.churn) == (2, 2, 4)
