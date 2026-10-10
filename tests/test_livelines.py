@@ -159,3 +159,41 @@ def test_porcelain_parser_on_real_blame_output(repo, shas):
     blamed = _porcelain_shas(out)
     assert len(blamed) == 4  # a.txt has 4 lines at the tip
     assert set(blamed) <= set(shas.values())  # every line maps to a walked commit
+
+
+# ------------------------------------------------------- report additions --
+
+
+def test_report_renders_live_lines_column_and_size_chart(repo, tmp_path):
+    from skill_stats import htmlreport
+
+    h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
+    h2 = commit_files(repo, "feature b", {"g.txt": "b1\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    fa = add_feature(conn, "feature a")
+    fb = add_feature(conn, "feature b")
+    _define(conn, fa, h1)
+    _define(conn, fb, h2)
+    conn.commit()
+    update_live_lines(conn, repo)
+    page = htmlreport.build(conn)
+    assert "Live lines" in page  # ranking table column
+    assert "Feature size over time" in page  # sample-driven chart section
+    assert "feature a" in page and "feature b" in page
+    assert "unattributed" in page  # data-quality note (0 here)
+
+
+def test_report_graceful_without_samples(repo, tmp_path):
+    from skill_stats import htmlreport
+
+    h1 = commit_files(repo, "feature a", {"f.txt": "a1\na2\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")
+    fa = add_feature(conn, "feature a")
+    _define(conn, fa, h1)
+    conn.commit()
+    page = htmlreport.build(conn)  # live-lines never ran: no samples
+    assert "Live lines" in page
+    assert "Feature size over time" not in page  # section omitted, page still renders
+    assert "skill-stats report" in page

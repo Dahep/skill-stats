@@ -23,6 +23,7 @@ The measured point is the latest WALKED Target-branch commit — identical to
 the branch tip whenever walk ran first (update runs walk before live-lines).
 """
 
+import json
 import sqlite3
 import subprocess
 from collections import Counter
@@ -87,6 +88,11 @@ def update_live_lines(conn: sqlite3.Connection, repo_dir: Path) -> LiveLineResul
         conn.execute("UPDATE features SET live_lines = 0")
         for fid, n in per_feature.items():
             conn.execute("UPDATE features SET live_lines = ? WHERE id = ?", (n, fid))
+        # surfaced by the report (and the artifact) — never silently dropped
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('unattributed_lines', ?)",
+            (json.dumps(unattributed),),
+        )
     samples_written += _write_sample(conn, tip, alive, walk_of[tip], per_feature)
     conn.commit()
     return LiveLineResult(tip, unattributed, samples_written, backfilled_points)
