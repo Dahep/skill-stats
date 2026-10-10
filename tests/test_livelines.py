@@ -197,3 +197,47 @@ def test_report_graceful_without_samples(repo, tmp_path):
     assert "Live lines" in page
     assert "Feature size over time" not in page  # section omitted, page still renders
     assert "skill-stats report" in page
+
+
+# ------------------------------------- quoted names + first-parent blaming --
+
+
+def test_live_lines_handles_non_ascii_names_and_quoted_store_paths(repo, tmp_path):
+    # git quotes non-ASCII names in text ls-tree output: the live-lines file
+    # listing must use raw names, and store-path exclusion must see decoded
+    # names even when the store file itself is non-ASCII
+    h1 = commit_files(repo, "feature a", {"café.txt": "a1\na2\n"})
+    commit_files(repo, "store only", {".skill-stats/ünïcode.sql": "INSERT\n"})
+    h3 = commit_files(repo, "tip work", {"k.txt": "k1\n"})
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")  # the store-only commit is skipped by the walk
+    fa = add_feature(conn, "feature a")
+    _define(conn, fa, h1)
+    conn.commit()
+    res = update_live_lines(conn, repo)
+    assert res.at_sha == h3
+    # café.txt's lines attribute despite the quoted spelling; the non-ASCII
+    # store file is excluded on its decoded name (not blamed at all)
+    assert res.unattributed_lines == 0
+    assert dict(conn.execute("SELECT id, live_lines FROM features")) == {fa: 2}
+
+
+def test_merge_brought_lines_attribute_to_the_merge_commit(repo, tmp_path):
+    commit_files(repo, "base", {"b.txt": "b\n"})
+    run(repo, "checkout", "-b", "side")
+    commit_files(repo, "side feature", {"s.txt": "s1\ns2\n"})
+    run(repo, "checkout", "main")
+    run(repo, "merge", "--no-ff", "side", "-m", "merge side feature")
+    merge = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    conn = make_db(tmp_path / "l.db", repo)
+    walk(repo, conn, "main")  # first-parent walk: base + merge; side is absent
+    fm = add_feature(conn, "side feature")
+    _define(conn, fm, merge)
+    conn.commit()
+    res = update_live_lines(conn, repo)
+    # blame --first-parent assigns the side branch's lines to the merge commit
+    # (which the walk includes) -> its features; nothing goes unattributed
+    assert res.unattributed_lines == 0
+    assert dict(conn.execute("SELECT id, live_lines FROM features")) == {fm: 2}

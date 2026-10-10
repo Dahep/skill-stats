@@ -1,7 +1,9 @@
 """Live lines: per-feature line counts at the Target-branch tip via blame.
 
 Every line of every tracked file at the analyzed tip is owned by exactly one
-commit (``git blame -w -C --porcelain``); commit lines accrue to the Features
+commit (``git blame -w -C --first-parent --porcelain`` — first-parent like the
+walk, so merge-brought lines attribute to the merge commit the walk stores);
+commit lines accrue to the Features
 the commit is attributed to (grill-r3-Q7): directly via commits_features
 (defines/touches), and for fix commits through the fixes_features lineage
 closure — so fix-owned lines accrue to the features the fix reaches, and a
@@ -31,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .blame import _porcelain_shas
-from .gitwalk import _git, is_store_path
+from .gitwalk import _git, _unquote_git_path, is_store_path
 
 # Backfill plan caps (grill-r3-Q9 leaves the cap to implementation):
 # a full sweep up to this many walked commits, evenly sampled above it.
@@ -140,12 +142,17 @@ def _write_sample(
 
 
 def _line_counts_at(repo_dir: Path, sha: str) -> tuple[Counter[str], int]:
-    """(introducing commit -> line count, unblamable lines) at a commit."""
+    """(introducing commit -> line count, unblamable lines) at a commit.
+    --first-parent matches the walk's first-parent semantics: lines brought in
+    by side-branch commits (absent from the DB) attribute to the merge commit
+    the walk includes, instead of going unattributed."""
     counts: Counter[str] = Counter()
     unattributed = 0
     for path in _files_at(repo_dir, sha):
         try:
-            text = _git(repo_dir, "blame", "-w", "-C", "--porcelain", sha, "--", path)
+            text = _git(
+                repo_dir, "blame", "-w", "-C", "--first-parent", "--porcelain", sha, "--", path
+            )
         except subprocess.CalledProcessError:
             unattributed += _blob_line_count(repo_dir, sha, path)  # binary etc.
             continue
@@ -155,16 +162,36 @@ def _line_counts_at(repo_dir: Path, sha: str) -> tuple[Counter[str], int]:
 
 
 def _files_at(repo_dir: Path, sha: str) -> list[str]:
-    """Tracked paths at a commit, skipping store paths and submodule gitlinks."""
+    """Tracked paths at a commit, skipping store paths and submodule gitlinks.
+    Uses raw NUL-delimited ``ls-tree -z`` names: text output C-quotes special
+    spellings, which would both break blame lookups and let quoted store
+    paths slip past the exclusion check."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "ls-tree", "-r", "-z", sha],
+        capture_output=True,
+        check=True,
+    )
     paths = []
-    for line in _git(repo_dir, "ls-tree", "-r", sha).splitlines():
-        meta, _, name = line.partition("\t")
-        if meta.split()[0] == "160000":
-            continue  # gitlinks: blame never descends into submodule content
-        if is_store_path(name):
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
             continue
-        paths.append(name)
+        meta, _, name = entry.partition(b"\t")
+        if meta.split()[0] == b"160000":
+            continue  # gitlinks: blame never descends into submodule content
+        path = _decode_name(name)
+        if is_store_path(path):
+            continue
+        paths.append(path)
     return paths
+
+
+def _decode_name(raw: bytes) -> str:
+    """Raw ls-tree name to str. ``-z`` output is never quoted, but a
+    defensively quoted-looking spelling (with escapes) is decoded so exclusion
+    and blame always see the real path."""
+    if raw[:1] == b'"' and raw[-1:] == b'"' and b"\\" in raw[1:-1]:
+        return _unquote_git_path(raw.decode("ascii", "surrogateescape"))
+    return raw.decode("utf-8", "surrogateescape")
 
 
 def _blob_line_count(repo_dir: Path, sha: str, path: str) -> int:
